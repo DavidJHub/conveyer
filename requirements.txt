@@ -1,0 +1,18 @@
+# Core (required)
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.3
+pyarrow>=12.0
+
+# Embeddings — pick at least one backend (auto-resolved, best first)
+voyageai>=0.3            # voyage-3-large (Anthropic-recommended, best English embeddings)
+# openai>=1.0            # text-embedding-3-large
+sentence-transformers>=2.6   # open fallback (BAAI/bge-large-en-v1.5, Qwen3-Embedding, ...)
+
+# Data-driven topic modelling (optional; KMeans works without these)
+bertopic>=0.16
+umap-learn>=0.5
+hdbscan>=0.8
+
+# LLM cluster naming / zero-shot intent (optional)
+anthropic>=0.40

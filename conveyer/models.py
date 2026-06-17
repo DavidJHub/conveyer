@@ -189,11 +189,12 @@ class AnthropicLLM:
 
 
 def build_llm(cfg: PipelineConfig) -> "AnthropicLLM | None":
-    """Return an LLM client if enabled and usable, else ``None``."""
-    if not cfg.use_llm_naming:
+    """Return an LLM client if any LLM-backed feature is enabled and usable."""
+    wants_llm = cfg.use_llm_naming or cfg.llm_keyphrase_expansion or cfg.llm_select_granularity
+    if not wants_llm:
         return None
     if not _have("anthropic") or not os.environ.get("ANTHROPIC_API_KEY"):
-        print("[models] LLM naming requested but anthropic/ANTHROPIC_API_KEY missing; skipping.")
+        print("[models] an LLM feature was requested but anthropic/ANTHROPIC_API_KEY is missing; skipping.")
         return None
     return AnthropicLLM(cfg)
 

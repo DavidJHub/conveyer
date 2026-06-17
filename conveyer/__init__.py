@@ -5,7 +5,7 @@ Public API:
     run_pipeline     end-to-end orchestration
     ingest, models, clustering, analysis   the individual stages
 """
-from . import analysis, clustering, ingest, models
+from . import analysis, clustering, ingest, models, viz
 from .config import PipelineConfig
 from .pipeline import run_pipeline
 
@@ -16,6 +16,7 @@ __all__ = [
     "models",
     "clustering",
     "analysis",
+    "viz",
 ]
 
 __version__ = "0.1.0"

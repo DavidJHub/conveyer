@@ -42,9 +42,18 @@ class PipelineConfig:
     embed_batch_size: int = 128
 
     # --- Clustering ---
-    n_clusters: int = 12                       # 'n' for KMeans (explicit "n groups" request)
+    n_clusters: int = 12                       # 'n' for partitional methods (explicit "n groups" request)
     k_sweep: Tuple[int, ...] = (4, 6, 8, 10, 12, 16, 20)
-    primary_label: str = "cluster_kmeans"      # cluster_kmeans | cluster_bertopic
+    # Method for the primary labelling. "auto" compares candidates and picks the
+    # best by cosine silhouette. Alternatives to k-means that fit embedding
+    # geometry better: agglomerative (cosine), spectral, gmm, hdbscan (density).
+    cluster_method: str = "auto"               # auto | kmeans | agglomerative | spectral | gmm | hdbscan
+    compare_methods: Tuple[str, ...] = ("kmeans", "agglomerative", "spectral", "gmm", "hdbscan")
+    max_dense_n: int = 8000                     # skip O(n^2) methods (spectral/agglo) above this N
+    # LLM-assisted layer (reduces reliance on the raw embedder; needs ANTHROPIC_API_KEY)
+    llm_keyphrase_expansion: bool = False       # expand short texts with LLM keyphrases before embedding
+    llm_select_granularity: bool = False        # ClusterLLM-style pairwise choice of n from a hierarchy
+    llm_pairs_budget: int = 30                  # max LLM pairwise queries for granularity selection
     # BERTopic / HDBSCAN
     min_cluster_size: int = 40
     min_samples: int = 8
@@ -59,6 +68,7 @@ class PipelineConfig:
 
     # --- Outputs ---
     out_dir: str = "outputs"
+    build_dashboard: bool = True  # write an interactive outputs/dashboard.html
 
     def text_column(self) -> str:
         return "_text"

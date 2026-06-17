@@ -8,7 +8,6 @@ so nothing hard-fails in a minimal environment:
     Voyage (voyage-3-large)  ->  OpenAI (text-embedding-3-large)
         ->  sentence-transformers (open)  ->  TF-IDF + SVD
 """
-from __future__ import annotations
 
 import importlib
 import os

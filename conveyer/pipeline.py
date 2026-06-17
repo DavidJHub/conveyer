@@ -10,7 +10,6 @@ or programmatically::
     from conveyer import PipelineConfig, run_pipeline
     results = run_pipeline(PipelineConfig(data_path="data/conversations.parquet"))
 """
-from __future__ import annotations
 
 import argparse
 import os

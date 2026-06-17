@@ -4,7 +4,6 @@ All modules read from a single :class:`PipelineConfig` instance so the column
 mapping, model choices and hyper-parameters live in one place. Everything is
 tuned for **English** skincare-conversation data.
 """
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Tuple

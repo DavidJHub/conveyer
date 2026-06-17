@@ -5,7 +5,6 @@ recommendations, and cluster naming.
 These are the deliverables; the clusters are just the segments the metrics are
 read over. Everything assumes **English** text.
 """
-from __future__ import annotations
 
 import json
 import re

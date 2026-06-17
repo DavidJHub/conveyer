@@ -9,7 +9,6 @@
 The number of clusters is a hyper-parameter, not a fact in the data; report the
 sweep and (optionally) stability rather than a single ``n``.
 """
-from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence, Tuple
 

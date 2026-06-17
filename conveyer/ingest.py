@@ -2,7 +2,6 @@
 fields, and (when no dataset is present) generate realistic **English**
 synthetic data so the pipeline runs end-to-end.
 """
-from __future__ import annotations
 
 import ast
 import os

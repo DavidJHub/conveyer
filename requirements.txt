@@ -14,5 +14,9 @@ bertopic>=0.16
 umap-learn>=0.5
 hdbscan>=0.8
 
-# LLM cluster naming / zero-shot intent (optional)
+# LLM cluster naming / zero-shot intent / ClusterLLM-style granularity (optional)
 anthropic>=0.40
+
+# Visualization dashboard
+plotly>=5.20
+scipy>=1.10            # hierarchy for LLM granularity selection (usually pulled by scikit-learn)

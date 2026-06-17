@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Datos y salidas generadas por el notebook
+/data/*
+!/data/README.md
+/outputs/

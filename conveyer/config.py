@@ -21,7 +21,7 @@ class PipelineConfig:
     col_answer: str = "answer"
     col_brands_q: str = "brands_in_question"
     col_brands_a: str = "brands_in_answer"
-    col_niq: str = "skin_care_categories"  # reference taxonomy used for external validation
+    col_categories: str = "skin_care_categories"  # reference taxonomy used for external validation
     col_session: str = "session_id"
     col_session_pos: str = "session_pos"
 

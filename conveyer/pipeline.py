@@ -54,7 +54,7 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, object]:
     print(f"[embeddings] {embeddings.shape} via {emb_name} | docs={len(texts)}")
 
     # 3) Clustering: compare methods, pick granularity, pick method --------- #
-    niq = work[cfg.col_niq].astype(str).tolist() if cfg.col_niq in work.columns else None
+    niq = work[cfg.col_categories].astype(str).tolist() if cfg.col_categories in work.columns else None
     sweep = clustering.kmeans_sweep(embeddings, cfg)
     comparison = clustering.compare_methods(embeddings, cfg, niq=niq)
     print("[methods]\n" + comparison.to_string(index=False))
@@ -101,8 +101,8 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, object]:
     os.makedirs(cfg.out_dir, exist_ok=True)
     labeled_cols = [cfg.col_question, "cluster", "cluster_kmeans", "cluster_name", "intent",
                     "asks_recommendation", "is_recommendation", "n_brands_answer"]
-    if cfg.col_niq in work.columns:
-        labeled_cols.append(cfg.col_niq)
+    if cfg.col_categories in work.columns:
+        labeled_cols.append(cfg.col_categories)
     if "cluster_bertopic" in work.columns:
         labeled_cols.append("cluster_bertopic")
     labeled = work[labeled_cols]

@@ -111,7 +111,7 @@ def cluster_summary(work: pd.DataFrame, cfg: PipelineConfig, label_col: str = "c
     rows = []
     for cl, sub in work.groupby(label_col):
         intent_mix = sub["intent"].value_counts(normalize=True)
-        niq_mode = sub[cfg.col_niq].astype(str).mode() if cfg.col_niq in sub.columns else pd.Series([], dtype=str)
+        niq_mode = sub[cfg.col_categories].astype(str).mode() if cfg.col_categories in sub.columns else pd.Series([], dtype=str)
         rows.append({
             "cluster": cl,
             "size": len(sub),
@@ -135,9 +135,9 @@ def validate_against_niq(work: pd.DataFrame, cfg: PipelineConfig,
     """ARI/NMI between cluster labels and the NIQ category column."""
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
-    if cfg.col_niq not in work.columns:
+    if cfg.col_categories not in work.columns:
         return {}
-    niq = work[cfg.col_niq].astype(str).tolist()
+    niq = work[cfg.col_categories].astype(str).tolist()
     out: Dict[str, Dict[str, float]] = {}
     for col in label_cols:
         if col in work.columns:

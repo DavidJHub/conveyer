@@ -7,6 +7,11 @@ with ChatGPT (US, Jan 2026), joined with the SimilarWeb star schema
 (arXiv:2508.02630) to study how subtle prompt changes move agent purchase
 decisions.
 
+📖 **Project wiki:** [docs/PIPELINE_AND_HYPOTHESES.md](docs/PIPELINE_AND_HYPOTHESES.md) —
+the final pipeline, the hypothesis for every research question, where the LLM
+enters the funnel, the feature → probability map, and the full journey-HMM
+specification.
+
 ## Project layout
 
 ```

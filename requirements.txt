@@ -3,6 +3,9 @@ pandas>=2.0
 numpy>=1.24
 scikit-learn>=1.3
 pyarrow>=12.0
+scipy>=1.10
+networkx>=3.0            # interaction network (conveyer.graphs)
+matplotlib>=3.7          # notebook figures
 
 # Embeddings — pick at least one backend (auto-resolved, best first)
 voyageai>=0.3            # voyage-3-large (Anthropic-recommended, best English embeddings)
@@ -19,4 +22,7 @@ anthropic>=0.40
 
 # Visualization dashboard
 plotly>=5.20
-scipy>=1.10            # hierarchy for LLM granularity selection (usually pulled by scikit-learn)
+
+# ACES simulator (optional, for real VLM-agent runs — the offline logit agent
+# in conveyer.aces needs nothing extra). Clone + install separately:
+#   git clone https://github.com/mycustomai/ACES && cd ACES && uv sync --all-packages

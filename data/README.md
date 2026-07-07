@@ -1,9 +1,13 @@
 # data/
 
-Coloca aquí el dataset de conversaciones. El notebook
-(`notebooks/01_text_clustering_pipeline.ipynb`) busca por defecto:
+Coloca aquí los datasets. Rutas que buscan los notebooks:
 
-    data/conversations.parquet
+    data/conversations.parquet            # log crudo de conversaciones (notebooks 01, 03, 04)
+    data/similarweb_transformed_data/     # parquets del star schema SimilarWeb (notebooks 02, 04)
+
+El notebook maestro (`notebooks/04_aces_and_research_questions.ipynb`) usa
+ambos si existen y cae a datos sintéticos si faltan. Los experimentos
+exportados para el simulador ACES se escriben en `outputs/aces/`.
 
 Formatos soportados (autodetectados por extensión): `.parquet`, `.csv`, `.jsonl`, `.json`.
 

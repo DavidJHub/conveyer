@@ -12,6 +12,11 @@ the final pipeline, the hypothesis for every research question, where the LLM
 enters the funnel, the feature → probability map, and the full journey-HMM
 specification.
 
+📚 **State of the art:** [docs/STATE_OF_THE_ART.md](docs/STATE_OF_THE_ART.md) —
+literature & industry review (July 2026): agent-behaviour simulators and bias
+audits, methods to infer LLM/agent recommendations at scale, evidence on their
+impact on purchase decisions, and where conveyer sits in the gaps.
+
 ## Project layout
 
 ```

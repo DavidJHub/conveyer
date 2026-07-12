@@ -315,3 +315,4 @@ transition matrix.**
 Bayesian MMM: Jin et al. (2017), PyMC-Marketing · rank-ordered logit: Beggs,
 Cardell & Hausman (1981) · IO-HMM: Bengio & Frasconi (1995) · interventional
 Shapley: Janzing et al. (2020).*
+

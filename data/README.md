@@ -3,10 +3,14 @@
 Coloca aquí los datasets. Rutas que buscan los notebooks:
 
     data/conversations.parquet            # log crudo de conversaciones (notebooks 01, 03, 04)
-    data/similarweb_transformed_data/     # parquets del star schema SimilarWeb (notebooks 02, 04)
+    data/similarweb_transformed_data/     # star schema analítico: funnel + topics (notebooks 02, 04)
+    data/similarweb_clickstream_data/     # vista conductual: clicks/visitas/compras (clickstream_data_analysis.ipynb)
+
+📖 **Esquemas detallados, diagramas ER y documentación de campos de ambos
+datasets SimilarWeb:** [`docs/DATA_DICTIONARY.md`](../docs/DATA_DICTIONARY.md).
 
 El notebook maestro (`notebooks/04_aces_and_research_questions.ipynb`) usa
-ambos si existen y cae a datos sintéticos si faltan. Los experimentos
+los datos si existen y cae a datos sintéticos si faltan. Los experimentos
 exportados para el simulador ACES se escriben en `outputs/aces/`.
 
 Formatos soportados (autodetectados por extensión): `.parquet`, `.csv`, `.jsonl`, `.json`.

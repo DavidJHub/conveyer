@@ -17,6 +17,13 @@ literature & industry review (July 2026): agent-behaviour simulators and bias
 audits, methods to infer LLM/agent recommendations at scale, evidence on their
 impact on purchase decisions, and where conveyer sits in the gaps.
 
+🗄️ **Data dictionary:** [docs/DATA_DICTIONARY.md](docs/DATA_DICTIONARY.md) —
+ER diagrams, detailed schemas and field documentation for
+`data/similarweb_transformed_data/` (star schema: funnel + topics, profiled by
+notebook 02) and `data/similarweb_clickstream_data/` (clicks / visits /
+purchases, profiled by `clickstream_data_analysis.ipynb`), including join
+integrity and the gotchas checklist.
+
 ## Project layout
 
 ```

@@ -11,9 +11,11 @@ Public API:
     graphs       user x session x entity interaction network
     attribution  Bayesian conversion, MRP extrapolation, MMM, MNL utility
                  model, Shapley explanations
+    scraping     scrape surfaced pages, classify them (catalogue/landing/shopping/
+                 …), extract product metadata and match it to the chat recommendation
 """
 from . import (aces, analysis, attribution, augment, clustering, funnel,
-               graphs, ingest, models, viz)
+               graphs, ingest, models, scraping, viz)
 from .config import PipelineConfig
 from .pipeline import run_pipeline
 
@@ -30,6 +32,7 @@ __all__ = [
     "funnel",
     "graphs",
     "attribution",
+    "scraping",
 ]
 
 __version__ = "0.2.0"

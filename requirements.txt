@@ -20,6 +20,11 @@ hdbscan>=0.8
 # LLM cluster naming / zero-shot intent / ClusterLLM-style granularity (optional)
 anthropic>=0.40
 
+# Page scraping (conveyer.scraping) — offline/synthetic mode needs nothing extra
+requests>=2.31           # online fetching (--online); polite by construction
+beautifulsoup4>=4.12     # optional: better HTML parsing (stdlib html.parser fallback)
+lxml>=5.0                # optional: fast parser backend for beautifulsoup4
+
 # Visualization dashboard
 plotly>=5.20
 

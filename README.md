@@ -24,6 +24,11 @@ notebook 02) and `data/similarweb_clickstream_data/` (clicks / visits /
 purchases, profiled by `clickstream_data_analysis.ipynb`), including join
 integrity and the gotchas checklist.
 
+🕸️ **Scraped-pages schema:** [docs/SCRAPED_PAGES_SCHEMA.md](docs/SCRAPED_PAGES_SCHEMA.md) —
+the derived parquet star written by `conveyer.scraping` (page taxonomy,
+`fact_scraped_page` / `fact_scraped_product` columns, join paths back to the
+clickstream tables, caveats).
+
 ## Project layout
 
 ```
@@ -44,6 +49,11 @@ conveyer/                     the Python package
   graphs.py                   user x session x entity network, direct/indirect exposure (Q2)
   attribution.py              Bayesian conversion (Q3), MRP extrapolation (Q4), MMM (Q5),
                               conditional-logit utility model (Q6), exact Shapley (Q8)
+  scraping/                   scrape the URLs surfaced in the clickstream, classify each
+                              page (catalogue / brand landing / shopping / editorial / …,
+                              mapped to funnel stages), extract product metadata and match
+                              it to the chat recommendation; writes its own parquet star
+                              (CLI: python -m conveyer.scraping)
 
 notebooks/
   01_text_clustering_pipeline.ipynb   conversation clustering & segment characterisation
@@ -52,6 +62,8 @@ notebooks/
   04_aces_and_research_questions.ipynb  ⭐ master notebook — ACES integration, reorganised
                                       results, and a hypothesis + working prototype for each
                                       research question
+  05_page_scraping.ipynb              scrape + classify surfaced pages, product ↔ chat
+                                      matching, the scraped-pages parquet star
   archive/                            earlier iterations kept for reference
 
 data/                        datasets (not versioned) — see data/README.md

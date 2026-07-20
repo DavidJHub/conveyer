@@ -8,6 +8,7 @@ executed profiling notebooks — regenerate them by re-running:
 |---|---|---|
 | `data/similarweb_transformed_data/` | [`notebooks/02_similarweb_star_schema.ipynb`](../notebooks/02_similarweb_star_schema.ipynb) | *Analytical* view: turns + extracted entities + concepts + **funnel stages** + **topics** |
 | `data/similarweb_clickstream_data/` | [`clickstream_data_analysis.ipynb`](../clickstream_data_analysis.ipynb) | *Behavioral* view: turns + entities + concepts + **click-throughs / visits / purchases** + destination-site catalog + raw input |
+| `outputs/scrape/` (derived) | [`notebooks/05_page_scraping.ipynb`](../notebooks/05_page_scraping.ipynb) | *Scraped* view of the surfaced URLs: page classification + extracted products matched to the chat — schema in [`SCRAPED_PAGES_SCHEMA.md`](SCRAPED_PAGES_SCHEMA.md) |
 
 Both are ChatGPT skincare activity, **US, desktop, January 2026** (2026-01-01 →
 2026-02-01). They share three table schemas but are **different samples** —

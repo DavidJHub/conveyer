@@ -211,6 +211,41 @@ with_prior = pages[pages["prior_page_type"] != ""]
 pd.crosstab(with_prior["prior_page_type"], with_prior["page_subtype"])
 """)
 
+md("""
+### URL-only classification — the multimodal guarantee
+
+Many surfaced URLs can never be fetched (bot walls, logins, dead links, carts).
+The classifier is **multimodal** — URL tokens, domain knowledge, page markup
+and the vendor prior vote independently, and any one can carry a page alone —
+so obvious URLs classify correctly with **zero content**:
+`amazon.com` + `/gp/cart/` *is* a retailer cart, fetched or not.
+`classification_signals` records which modalities fired. Topic-neutral pages
+(carts, checkouts, SERPs, storefront entries) are journey infrastructure and
+are never demoted for lacking skincare tokens; a topical page (like an opaque
+`/dp/ASIN` PDP) keeps its structural role, with `is_study_relevant` tracking
+what we don't yet know.
+""")
+
+code("""
+from conveyer.scraping.classify import classify_rule
+from conveyer.scraping.extract import extract_page
+
+url_only = [
+    "https://www.amazon.com/gp/cart/view.html?ref_=nav_cart",   # retailer cart
+    "https://www.sephora.com/checkout",                          # retailer checkout
+    "https://www.amazon.com/",                                   # storefront entry
+    "https://www.amazon.com/dp/B00365FJ8K",                      # opaque PDP
+    "https://www.google.com/search?q=best+retinol",              # SERP
+    "https://www.reddit.com/r/SkincareAddiction/comments/1/x",   # community
+    "https://someblog-nobody-knows.xyz/post/123",                # nothing to go on
+]
+pd.DataFrame([{
+    "url": u, "category": c.page_category, "subtype": c.page_subtype,
+    "seller": c.seller_type, "funnel": c.funnel_stage,
+    "relevant": c.is_study_relevant, "signals": ", ".join(c.signals),
+} for u in url_only for c in [classify_rule(extract_page("", u), u, cfg)]])
+""")
+
 # ---------------------------------------------------------------------------- #
 md("""
 ## 4 · Attention ranking — dwell time from the browsing trail

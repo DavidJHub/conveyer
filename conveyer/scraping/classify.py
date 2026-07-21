@@ -6,20 +6,35 @@ when available, the SimilarWeb ``dim_digital_site`` prior), decide the headline
 *shopping* (retailer or brand-owned), *unrelated* — and the four proposed extra
 categories (*editorial, search, community, reference*).
 
-The default path is a **transparent rule scorer** in the spirit of
-``conveyer.funnel``: URL structure, registrable domain against curated
-skincare-retailer / editorial / community / search / reference / brand lists,
-schema.org ``@type`` markup, OpenGraph ``og:type``, and price / add-to-cart /
-product-count signals each vote for categories; the argmax wins with a softmax
-confidence. The vendor ``page_type`` acts as a prior that is blended in
-(``use_similarweb_prior``). An optional LLM pass (``classifier="llm"`` /
-``"auto"`` when ``ANTHROPIC_API_KEY`` is set) refines low-confidence pages.
+The classifier is **multimodal**: four independent evidence channels vote and
+any one of them can carry a page on its own —
 
-Topical relevance is a **separate axis** from page structure: a page that is
-structurally a PDP but sells headphones is *unrelated to this study*, so the
-final ``page_category`` collapses to ``unrelated`` when skincare/beauty relevance
-is below threshold, while ``page_subtype`` keeps the structural label so nothing
-is lost.
+1. **URL structure** — path/query tokens (``/cart/``, ``checkout``,
+   ``/dp/…``, ``/search?q=``, ``ref_=nav_cart``, …);
+2. **domain knowledge** — the registrable domain against curated retailer /
+   marketplace / search / community / editorial / reference / brand lists
+   (``amazon.com`` *is* a retailer, fetched or not);
+3. **page content & markup** — schema.org ``@type``, OpenGraph, price /
+   add-to-cart / product-count signals (only when the page was fetched);
+4. **vendor prior** — ``dim_digital_site.page_type`` when available.
+
+Votes are summed, the argmax wins with a softmax confidence, and
+``PageClass.signals`` records which modalities actually fired so every label is
+auditable. An optional LLM pass (``classifier="llm"`` / ``"auto"`` when
+``ANTHROPIC_API_KEY`` is set) refines low-confidence pages.
+
+Topical relevance is a **separate axis** from page structure, with collapse
+rules that respect what each modality can know:
+
+* **topic-neutral subtypes** (cart, checkout, search results, marketplace and
+  storefront homepages) carry no topical tokens *by nature* — they are journey
+  infrastructure and are never collapsed for lacking skincare evidence;
+* **topical subtypes** (PDP, article, …) *with* fetched content and no skincare
+  signal collapse to ``unrelated`` (a confident judgement);
+* topical subtypes *without* content keep their structural category when the
+  domain is a known one (an unfetched ``amazon.com/dp/…`` is still a shopping
+  page — for *which* product is what ``is_study_relevant`` tracks), and fall
+  to ``unknown`` only when the domain tells us nothing either.
 """
 
 from __future__ import annotations
@@ -153,6 +168,24 @@ class PageClass:
     primary_brand: str = ""
     brand_detected: List[str] = field(default_factory=list)
     scores: Dict[str, float] = field(default_factory=dict)
+    signals: List[str] = field(default_factory=list)  # modalities that fired: url/domain/markup/prior/content
+
+
+# Subtypes that carry no topical tokens by nature — journey infrastructure.
+# Lack of skincare evidence must never collapse these (an Amazon cart URL says
+# nothing about skincare and never will).
+TOPIC_NEUTRAL_SUBTYPES = {"cart", "checkout", "serp", "site_search",
+                          "marketplace", "homepage", "listing"}
+
+
+def _known_domain(u: UrlParts) -> bool:
+    """Domain modality has an opinion: the registrable domain is in one of the
+    curated lists (or is .gov/.edu), so its role is known without fetching."""
+    tld = u.registrable.rsplit(".", 1)[-1] if u.registrable else ""
+    return (u.core in RETAILER_DOMAINS or u.core in BRAND_DOMAINS
+            or u.core in SEARCH_DOMAINS or u.core in COMMUNITY_DOMAINS
+            or u.core in EDITORIAL_DOMAINS or u.core in REFERENCE_DOMAINS
+            or tld in ("gov", "edu"))
 
 
 # --------------------------------------------------------------------------- #
@@ -168,15 +201,23 @@ def _url_subtype_votes(u: UrlParts) -> Dict[str, float]:
 
     if path in ("", "/", "/index.html", "/home", "/us", "/en", "/en-us"):
         add("homepage", 2.0)
-    if re.search(r"/(dp|gp/product|ip|product|products|p|prod|pd)(/|$|-)", path) or \
-       re.search(r"[?&](sku|productid|pid)=", "?" + q):
+    if re.search(r"/(dp|gp/product|ip|product|products|p|prod|pd|itm)(/|$|-)", path) or \
+       re.search(r"[?&](sku|productid|pid|asin)=", "?" + q):
         add("pdp", 2.0)
     if re.search(r"/(collections?|categor(y|ies)|shop|browse|store|c|b|departments?)(/|$)", path):
         add("collection", 1.6)
-    if re.search(r"/(cart|basket|bag)(/|$)", path):
+    # cart/checkout: transactional tokens are decisive wherever they appear —
+    # /gp/cart/view.html, /checkout/p/..., basket.jsp, ?ref_=nav_cart
+    if re.search(r"/(cart|basket|bag|wishlist)(/|$|\.)", path) or "/gp/cart" in path:
         add("cart", 2.5)
-    if re.search(r"/(checkout|order|payment)(/|$)", path):
+    if re.search(r"/(checkout|payments?|buy)(/|$|\.)", path) or "/gp/buy" in path:
         add("checkout", 2.5)
+    elif "checkout" in path:
+        add("checkout", 1.5)
+    if re.search(r"(^|[?&_=-])cart\b", q):
+        add("cart", 1.0)          # e.g. ref_=nav_cart
+    if "checkout" in q:
+        add("checkout", 0.8)
     if re.search(r"/search", path) or re.search(r"[?&](q|k|query|search|keyword)=", "?" + q):
         add("serp", 2.0)
     if re.search(r"/(blog|article|news|reviews?|guide|guides|best|stories|tips)(/|$)", path) or \
@@ -207,6 +248,10 @@ def _domain_votes(u: UrlParts, page: PageContent, chat_brands: set) -> Dict[str,
         add("marketplace", 1.2)
     if core in RETAILER_DOMAINS:
         add("listing", 0.6)     # retailer, exact role decided by path/markup
+        # a retailer's root page is its storefront entry (browse-many), not a
+        # brand landing page — outvote the generic "homepage" reading
+        if u.path in ("", "/", "/index.html"):
+            add("marketplace", 2.6)
     # brand-owned: known brand domain, or the domain core matches a brand the
     # chat recommended / the page's own product brand
     page_brand_tokens = {normalize(page.og.get("product:brand", ""))} | {
@@ -294,21 +339,34 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     u = parse_url(url or page.url)
     prior = prior or {}
 
+    # each modality votes independently; any one can carry the page alone
+    modality_votes = {
+        "url": _url_subtype_votes(u),
+        "domain": _domain_votes(u, page, chat_brands),
+        "markup": _markup_votes(page, n_products),
+    }
     votes: Dict[str, float] = {}
-    for src in (_url_subtype_votes(u), _domain_votes(u, page, chat_brands),
-                _markup_votes(page, n_products)):
+    for src in modality_votes.values():
         for k, w in src.items():
             votes[k] = votes.get(k, 0.0) + w
 
     # SimilarWeb prior: nudge the mapped subtype
     prior_page_type = str(prior.get(cfg.col_page_type, "") or "").lower()
-    if cfg.use_similarweb_prior and prior_page_type in SIMILARWEB_PAGE_TYPE_TO_SUBTYPE:
+    prior_fired = cfg.use_similarweb_prior and prior_page_type in SIMILARWEB_PAGE_TYPE_TO_SUBTYPE
+    if prior_fired:
         sub = SIMILARWEB_PAGE_TYPE_TO_SUBTYPE[prior_page_type]
         votes[sub] = votes.get(sub, 0.0) + 3.0 * cfg.prior_weight
 
+    has_content = bool(page.title or page.text or page.og)
+    signals = [name for name, v in modality_votes.items() if v]
+    if prior_fired:
+        signals.append("prior")
+    if has_content and "markup" not in signals:
+        signals.append("content")
+
     if not votes:
         return PageClass(page_category="unknown", page_subtype="other",
-                         confidence=0.0, method="rule",
+                         confidence=0.0, method="rule", signals=signals,
                          skincare_relevance=_skincare_relevance(page, u, chat_brands,
                                                                 str(prior.get(cfg.col_site_category, ""))))
 
@@ -322,7 +380,11 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
 
     relevance = _skincare_relevance(page, u, chat_brands,
                                     str(prior.get(cfg.col_site_category, "")))
-    is_relevant = relevance >= 0.15
+    neutral = subtype in TOPIC_NEUTRAL_SUBTYPES
+    known = _known_domain(u)
+    # journey infrastructure (a cart on a known retailer, a SERP, a storefront
+    # entry) is relevant to the journey by virtue of being *in* it
+    is_relevant = relevance >= 0.15 or (neutral and known)
 
     # seller type (only meaningful for commerce categories)
     seller = "na"
@@ -335,13 +397,17 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
             seller = "retailer"
 
     # topical relevance overrides the headline bucket (user's "unrelated" case).
-    # "unrelated" is a *confident* judgement — it needs page content (or URL
-    # evidence) to stand on. A page we never fetched stays "unknown", with the
-    # structural subtype preserved.
-    has_content = bool(page.title or page.text or page.og)
+    # "unrelated" is a *confident* judgement — it needs fetched content to
+    # stand on. Without content, the domain modality stands in: a known
+    # domain's structural role holds (an unfetched amazon.com/dp/… is still a
+    # shopping page); only a no-content page on an unknown domain is "unknown".
+    # Topic-neutral subtypes were already exempted above.
     final_category = category
     if not is_relevant and category != "unknown":
-        final_category = "unrelated" if has_content else "unknown"
+        if has_content:
+            final_category = "unrelated"
+        elif not known:
+            final_category = "unknown"
 
     # page-intrinsic brand (the brand this page is *about*) — used for matching.
     # Deliberately NOT the chat brand: letting a brand-less product inherit the
@@ -355,7 +421,7 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     brands = sorted({b for b in chat_brands} | ({page_brand} if page_brand else set()))
     brands = [b for b in brands if b]
 
-    method = "rule+prior" if (cfg.use_similarweb_prior and prior_page_type) else "rule"
+    method = "rule+prior" if prior_fired else "rule"
     return PageClass(
         page_category=final_category, page_subtype=subtype, seller_type=seller,
         funnel_stage=funnel_stage_for(final_category, subtype),
@@ -363,6 +429,7 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
         skincare_relevance=relevance, is_study_relevant=is_relevant,
         primary_brand=primary_brand, brand_detected=brands,
         scores={k: round(v, 3) for k, v in sorted(cat_scores.items(), key=lambda x: -x[1])},
+        signals=signals,
     )
 
 
@@ -421,7 +488,7 @@ def classify_llm(page: PageContent, url: str, cfg: ScrapeConfig,
         method="llm", skincare_relevance=rule_result.skincare_relevance,
         is_study_relevant=bool(data.get("is_skincare", rule_result.is_study_relevant)),
         primary_brand=rule_result.primary_brand, brand_detected=rule_result.brand_detected,
-        scores=rule_result.scores,
+        scores=rule_result.scores, signals=rule_result.signals + ["llm"],
     )
     return out
 

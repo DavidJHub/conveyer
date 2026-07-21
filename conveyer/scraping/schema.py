@@ -53,6 +53,7 @@ PAGE_SCHEMA = pa.schema([
     # classification
     ("page_category", _S), ("page_subtype", _S), ("page_category_confidence", _F64),
     ("seller_type", _S), ("funnel_stage", _S), ("classifier_method", _S),
+    ("classification_signals", _LS),
     ("skincare_relevance", _F64), ("is_study_relevant", _B),
     ("primary_brand", _S), ("brand_detected", _LS),
     # provenance + vendor prior
@@ -142,6 +143,7 @@ def page_row(url_row: dict, fetch: FetchResult, content: PageContent,
         "seller_type": cls.seller_type,
         "funnel_stage": cls.funnel_stage,
         "classifier_method": cls.method,
+        "classification_signals": list(cls.signals),
         "skincare_relevance": float(cls.skincare_relevance),
         "is_study_relevant": bool(cls.is_study_relevant),
         "primary_brand": cls.primary_brand,

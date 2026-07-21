@@ -63,15 +63,47 @@ distribution (search 46k · marketplace 6.7k · category 6.4k rows) plus the
 editorial/community pages that dominate skincare discovery don't fit the three
 requested buckets, and each occupies a distinct funnel position.
 
-**Topical relevance is a separate judgement from page structure**: a PDP that
-sells laptops is `page_category = unrelated` while `page_subtype` keeps the
-structural reading (`pdp`), so no information is destroyed.
+**The classifier is multimodal.** Four independent evidence channels vote —
+URL tokens (`/cart/`, `checkout`, `/dp/…`, `?q=`), domain knowledge (curated
+retailer / search / community / editorial / reference / brand lists),
+page content & markup (schema.org, OpenGraph, price/cart signals), and the
+vendor prior — and **any one can carry a page alone**.
+`classification_signals` records which fired. So
+`amazon.com/gp/cart/view.html?ref_=nav_cart` classifies as
+`shopping · cart · retailer · Purchase` with zero fetched content: the domain
+says retailer, the path says cart.
+
+**Topical relevance is a separate judgement from page structure**, with
+collapse rules that respect what each modality can know:
+
+* **topic-neutral subtypes** (cart, checkout, order, SERP, marketplace /
+  storefront entry) carry no topical tokens by nature — journey
+  infrastructure, never demoted for lacking skincare evidence. Neutrality
+  must be **earned** by a structural vote (URL tokens, markup, the vendor
+  prior, or a decisive domain role) — the weak retailer catch-all vote does
+  not qualify, so `sephora.com/careers` or `amazon.com/prime` stay `unknown`
+  rather than becoming "relevant catalogue" pages. A SERP whose URL exposes
+  its query is judged by the query text instead (`q=best+retinol` is
+  relevant, `q=gaming+laptops` is not);
+* **transactional URL tokens are self-evident commerce** on *any* domain: an
+  unfetchable `/checkouts/c/<token>` on an unheard-of Shopify store is still
+  `shopping · checkout · Purchase`;
+* a topical page (PDP, article, …) **with fetched content** and no skincare
+  signal → `unrelated` (a confident judgement; `page_subtype` keeps the
+  structural reading, so no information is destroyed);
+* a topical page **without content** keeps its *earned* structural category on
+  a known domain (an unfetched `amazon.com/dp/…` is still a shopping page)
+  with `is_study_relevant = false` until evidence arrives; with no earned
+  role, or on an unknown domain, it stays `unknown`.
 
 `page_subtype` (structural): `homepage · landing · brand_site · collection ·
-category · marketplace · listing · pdp · cart · checkout · article · review ·
-listicle · serp · site_search · forum · social · qa · wiki · health · howto ·
-other`. The vendor's `page_type` maps onto these
+category · marketplace · listing · pdp · cart · checkout · order · wishlist ·
+article · review · listicle · serp · site_search · forum · social · qa · wiki ·
+health · howto · other`. The vendor's `page_type` maps onto these
 (`taxonomy.SIMILARWEB_PAGE_TYPE_TO_SUBTYPE`) and acts as a classifier prior.
+Funnel bumps: `cart`/`checkout` → Purchase and `order` → Post-Purchase, applied
+only to real `shopping` pages; `wishlist` stays Intent (saved-for-later is not
+a purchase event).
 
 ---
 
@@ -105,7 +137,7 @@ erDiagram
 
 ---
 
-## 3 · `fact_scraped_page` — 52 columns (grain = one URL)
+## 3 · `fact_scraped_page` — 56 columns (grain = one URL)
 
 ### Identity & URL parts
 
@@ -153,9 +185,10 @@ erDiagram
 | `page_category_confidence` | float64 | softmax over category-level rule scores, 0–1 |
 | `seller_type` | string | `brand_owned · retailer · na` |
 | `funnel_stage` | string | Awareness … Post-Purchase / Irrelevant |
-| `classifier_method` | string | `rule · rule+prior · llm` |
-| `skincare_relevance` | float64 | 0–1 topical score (keywords + brand + domain) |
-| `is_study_relevant` | bool | `skincare_relevance ≥ 0.15` |
+| `classifier_method` | string | `rule · rule+prior · llm · error` |
+| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · prior · llm` |
+| `skincare_relevance` | float64 | 0–1 topical score (keywords + brands, in content **and** URL slugs) |
+| `is_study_relevant` | bool | `skincare_relevance ≥ 0.15`, or journey infrastructure (topic-neutral subtype on a known domain) |
 | `primary_brand` | string | page-intrinsic brand (brand domain or `product:brand`) |
 | `brand_detected` | list\<string\> | page brand ∪ brands the chat mentioned on linked turns |
 

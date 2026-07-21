@@ -227,7 +227,8 @@ def make_corpus(n_pages: int = 60, seed: int = 42) -> ScrapeSources:
     def add(url, html, cat, seller, subtype, message_id, recommended, coincides_expected,
             page_type_prior=None, seller_prior=None, retailer_brand=None, site_category=None):
         nonlocal site_id
-        html_by_url[url] = html
+        if html is not None:      # html=None → unfetchable page (URL-only classification)
+            html_by_url[url] = html
         if url in rows:  # same URL surfaced on another turn — merge provenance
             r = rows[url]
             if message_id not in r["message_ids"]:
@@ -309,6 +310,13 @@ def make_corpus(n_pages: int = 60, seed: int = 42) -> ScrapeSources:
         u, h, c, s, st = _unrelated(turn)
         add(u, h, c, s, st, mid, recommended=False, coincides_expected=False,
             page_type_prior="pdp" if turn % 2 == 0 else None)
+
+        # a cart page that can never be fetched (html=None → offline_miss):
+        # the multimodal classifier must label it from URL + domain alone
+        cart_url = (f"https://www.{retailer[1]}/gp/cart/view.html?ref_=nav_cart"
+                    if retailer[1] == "amazon.com" else f"https://www.{retailer[1]}/cart")
+        add(cart_url, None, "shopping", "retailer", "cart", mid,
+            recommended=False, coincides_expected=False)
 
         turn += 1
 

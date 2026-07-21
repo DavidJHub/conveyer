@@ -97,6 +97,8 @@ SUBTYPE_TO_CATEGORY: Dict[str, str] = {
     "pdp": "shopping",
     "cart": "shopping",
     "checkout": "shopping",
+    "order": "shopping",      # order status / history — Post-Purchase infrastructure
+    "wishlist": "shopping",   # saved-for-later — Intent, NOT a purchase event
     "article": "editorial",
     "review": "editorial",
     "listicle": "editorial",
@@ -110,8 +112,11 @@ SUBTYPE_TO_CATEGORY: Dict[str, str] = {
     "howto": "reference",
     "other": "unknown",
 }
-# Subtypes that push a shopping page from Intent to Purchase.
+# Subtypes that push a shopping page from Intent to Purchase / Post-Purchase.
+# The bumps only apply to real shopping pages — an "unknown"/"unrelated" page
+# with a cart-looking path must stay Irrelevant.
 PURCHASE_SUBTYPES = {"cart", "checkout"}
+ORDER_SUBTYPES = {"order"}
 
 # Bridge from the vendor's dim_digital_site.page_type to our subtype, so the
 # SimilarWeb label can act as a prior / weak supervision for the classifier.
@@ -129,8 +134,11 @@ SIMILARWEB_PAGE_TYPE_TO_SUBTYPE: Dict[str, str] = {
 
 def funnel_stage_for(category: str, subtype: str | None = None) -> str:
     """Funnel stage for a (category, subtype), applying the cart/checkout bump."""
-    if subtype in PURCHASE_SUBTYPES:
-        return "Purchase"
+    if category == "shopping":
+        if subtype in PURCHASE_SUBTYPES:
+            return "Purchase"
+        if subtype in ORDER_SUBTYPES:
+            return "Post-Purchase"
     return CATEGORY_TO_FUNNEL_STAGE.get(category, "Irrelevant")
 
 

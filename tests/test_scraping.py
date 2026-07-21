@@ -140,13 +140,82 @@ def test_classify_unrelated_offtopic():
     res = classify_rule(extract_page(html, url), url, cfg, chat_brands={"cerave"}, n_products=1)
     _check(res.page_category == "unrelated", f"off-topic -> {res.page_category}")
     _check(res.page_subtype == "pdp", f"subtype preserved: {res.page_subtype}")
-    # a page we never fetched must NOT be confidently "unrelated" — but a
-    # skincare-slugged URL is on-topic evidence even with zero HTML
+    # unfetched, but the domain is a known retailer: the structural role holds
+    # (it IS a shopping page — topicality is is_study_relevant's job)
     empty = classify_rule(extract_page("", url), url, cfg)
-    _check(empty.page_category == "unknown", f"no content -> {empty.page_category}")
+    _check(empty.page_category == "shopping", f"known-domain PDP -> {empty.page_category}")
+    _check(not empty.is_study_relevant, "no topical evidence -> not study-relevant")
     cera_url = "https://www.sephora.com/product/cerave-moisturizing-cream"
     cera = classify_rule(extract_page("", cera_url), cera_url, cfg)
     _check(cera.page_category == "shopping", f"URL-slug evidence -> {cera.page_category}")
+    _check(cera.is_study_relevant, "brand slug in URL -> study-relevant")
+    # unfetched on an UNKNOWN domain: nothing to stand on -> unknown
+    mystery = "https://someblog-nobody-knows.xyz/products/gaming-laptop"
+    myst = classify_rule(extract_page("", mystery), mystery, cfg)
+    _check(myst.page_category == "unknown", f"unknown domain, no content -> {myst.page_category}")
+
+
+def test_multimodal_url_only():
+    """Obvious URLs must classify correctly with ZERO fetched content —
+    domain modality + URL tokens carry the page (the amazon-cart regression)."""
+    cfg = ScrapeConfig()
+    cases = {
+        # url: (category, subtype, seller, funnel, study_relevant)
+        # the reported regression: retailer cart, never fetchable
+        "https://www.amazon.com/gp/cart/view.html?ref_=nav_cart":
+            ("shopping", "cart", "retailer", "Purchase", True),
+        "https://www.sephora.com/checkout": ("shopping", "checkout", "retailer", "Purchase", True),
+        "https://www.ulta.com/cart": ("shopping", "cart", "retailer", "Purchase", True),
+        "https://www.amazon.com/gp/aw/c": ("shopping", "cart", "retailer", "Purchase", True),
+        # transactional tokens are self-evident commerce on ANY domain —
+        # /checkouts/c/<token> must also beat the single-letter /c/ collection vote
+        "https://glowlab.myshopify.com/checkouts/c/0a1b2c3d":
+            ("shopping", "checkout", "na", "Purchase", True),
+        # order history is Post-Purchase infrastructure, wishlist is Intent
+        "https://www.amazon.com/gp/css/order-history":
+            ("shopping", "order", "retailer", "Post-Purchase", True),
+        "https://www.amazon.com/hz/wishlist/ls/ABCD123":
+            ("shopping", "wishlist", "retailer", "Intent", True),
+        # retailer roots (incl. locale roots) = storefront entry, not a brand landing
+        "https://www.amazon.com/": ("catalogue", "marketplace", "retailer", "Discovery", True),
+        "https://www.target.com/us": ("catalogue", "marketplace", "retailer", "Discovery", True),
+        # opaque ASIN PDP: role holds from URL+domain; the product (and hence
+        # topicality) stays unknown -> not study-relevant until fetched
+        "https://www.amazon.com/dp/B00365FJ8K": ("shopping", "pdp", "retailer", "Intent", False),
+        # a SERP that exposes its query is judged by the query text
+        "https://www.google.com/search?q=best+gaming+laptops": ("search", "serp", "na", "Intent", False),
+        "https://www.google.com/search?q=best+retinol": ("search", "serp", "na", "Intent", True),
+    }
+    for u, (cat, sub, seller, funnel, relevant) in cases.items():
+        r = classify_rule(extract_page("", u), u, cfg)
+        _check(r.page_category == cat, f"{u} -> {r.page_category} (want {cat})")
+        _check(r.page_subtype == sub, f"{u} subtype {r.page_subtype} (want {sub})")
+        _check(r.seller_type == seller, f"{u} seller {r.seller_type} (want {seller})")
+        _check(r.funnel_stage == funnel, f"{u} funnel {r.funnel_stage} (want {funnel})")
+        _check("url" in r.signals, f"{u} signals {r.signals} must include url")
+        _check(r.is_study_relevant == relevant,
+               f"{u}: is_study_relevant={r.is_study_relevant} (want {relevant})")
+
+
+def test_neutrality_must_be_earned():
+    """The weak retailer catch-all votes (listing 0.6 / marketplace 1.2) must
+    not turn /careers, /help or /prime into relevant journey pages."""
+    cfg = ScrapeConfig()
+    for u in ("https://www.sephora.com/careers", "https://www.amazon.com/prime",
+              "https://www.walmart.com/help"):
+        r = classify_rule(extract_page("", u), u, cfg)
+        _check(r.page_category == "unknown", f"{u} -> {r.page_category} (want unknown)")
+        _check(not r.is_study_relevant, f"{u} must not be study-relevant")
+    # with fetched off-topic content the judgement hardens to 'unrelated'
+    jobs = ("<html><head><title>Careers at Sephora</title></head><body><h1>Careers</h1>"
+            "<p>Join our team. Open roles in engineering and retail operations.</p></body></html>")
+    u = "https://www.sephora.com/careers"
+    r = classify_rule(extract_page(jobs, u), u, cfg)
+    _check(r.page_category == "unrelated", f"fetched careers -> {r.page_category}")
+    # an 'unknown' page with a cart-ish path must not be staged Purchase
+    from conveyer.scraping.taxonomy import funnel_stage_for
+    _check(funnel_stage_for("unknown", "cart") == "Irrelevant", "no Purchase bump off-shopping")
+    _check(funnel_stage_for("shopping", "order") == "Post-Purchase", "order stage")
 
 
 # --------------------------------------------------------------------------- #

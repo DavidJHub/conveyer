@@ -238,6 +238,10 @@ def make_corpus(n_pages: int = 60, seed: int = 42) -> ScrapeSources:
                 r["sources"].append("a_links_source")
             return
         site_id += 1
+        visits = int(rng.integers(0, 30))
+        # browsing-trail retention, as computed from next_10_urls request_time
+        # deltas on real data (None when the URL was never in a trail)
+        dwell = round(float(rng.lognormal(2.8, 0.9)), 3) if visits else None
         rows[url] = {
             "url": url, "digital_site_id": site_id, "domain": _domain_of(url),
             "page_type": page_type_prior, "seller_type": seller_prior,
@@ -245,9 +249,12 @@ def make_corpus(n_pages: int = 60, seed: int = 42) -> ScrapeSources:
             "extracted_skus": None, "message_ids": [message_id],
             "times_surfaced": int(rng.integers(1, 40)),
             "times_recommended": int(rng.integers(1, 6)) if recommended else 0,
-            "times_visited": int(rng.integers(0, 30)),
+            "times_visited": visits,
             "resulted_in_purchase_any": bool(rng.random() < 0.15),
             "sources": ["click_through"] + (["a_links_source"] if recommended else []),
+            "mean_dwell_seconds": dwell,
+            "total_dwell_seconds": round(dwell * max(1, visits), 3) if dwell else None,
+            "mean_trail_position": round(float(rng.uniform(1, 10)), 2) if visits else None,
         }
         gt[url] = {"url": url, "gt_category": cat, "gt_seller_type": seller,
                    "gt_subtype": subtype, "gt_coincides": coincides_expected}

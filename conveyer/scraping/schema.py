@@ -61,6 +61,10 @@ PAGE_SCHEMA = pa.schema([
     ("n_message_ids", _I32), ("message_ids", _LS),
     ("prior_page_type", _S), ("prior_seller_type", _S),
     ("prior_retailer_brand", _S), ("prior_site_category", _S),
+    # browsing-trail retention (from next_10_urls request_time deltas; the last
+    # trail entry has no successor, so it never contributes a dwell)
+    ("mean_dwell_seconds", _F64), ("total_dwell_seconds", _F64),
+    ("mean_trail_position", _F64),
 ])
 
 PRODUCT_SCHEMA = pa.schema([
@@ -153,6 +157,9 @@ def page_row(url_row: dict, fetch: FetchResult, content: PageContent,
         "prior_seller_type": _str_or_empty(url_row.get("seller_type")),
         "prior_retailer_brand": _str_or_empty(url_row.get("retailer_brand")),
         "prior_site_category": _str_or_empty(url_row.get("site_category")),
+        "mean_dwell_seconds": _f(url_row.get("mean_dwell_seconds")),
+        "total_dwell_seconds": _f(url_row.get("total_dwell_seconds")),
+        "mean_trail_position": _f(url_row.get("mean_trail_position")),
     }
 
 

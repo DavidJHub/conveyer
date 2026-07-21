@@ -1,9 +1,10 @@
-"""End-to-end scrape → extract → classify → match → parquet.
+"""End-to-end scrape → extract → classify → match → parquet, **incrementally**.
 
 Run as a module::
 
-    python -m conveyer.scraping.pipeline                 # synthetic corpus, offline
-    python -m conveyer.scraping.pipeline --clickstream-dir data/similarweb_clickstream_data --online
+    python -m conveyer.scraping                       # synthetic corpus, offline
+    python -m conveyer.scraping --clickstream-dir data/similarweb_clickstream_data/simweb_input_file.parquet \\
+        --online --max-urls 2000
 
 or programmatically::
 
@@ -12,27 +13,37 @@ or programmatically::
     art["pages"].head()                       # fact_scraped_page
     art["products"][art["products"].coincides].head()
 
-Everything is safe and offline by default: with no data and no network it runs on
-the synthetic corpus, classifies, matches products to the (synthetic) chat
-recommendation and writes both parquet files, then scores itself against the
-corpus ground truth.
+Designed so a long real-data run can neither hang nor lose work:
+
+* every URL is processed **as its fetch completes** (no batch barrier), under a
+  per-URL wall-clock cap (``ScrapeConfig.hard_timeout``);
+* every finished page is **appended immediately** to a line-per-record JSONL
+  sidecar (products first, then the page line as the commit marker), so a crash
+  or Ctrl-C loses at most the page in flight;
+* the parquet files are refreshed every ``checkpoint_every`` pages and on exit
+  (including on interrupt);
+* with ``resume=True`` (default) a re-run skips URLs already in the JSONL and
+  folds the previous results into the final parquet.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import time
 from dataclasses import asdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from .classify import classify_page
+from .classify import PageClass, classify_page
 from .config import ScrapeConfig
 from .extract import PageContent, extract_page
 from .fetch import Fetcher, FetchResult, _cache_path
 from .products import extract_products, match_products
-from .schema import PAGE_SCHEMA, PRODUCT_SCHEMA, build_frames, page_row, product_rows, write_parquet
+from .schema import (PAGE_SCHEMA, PRODUCT_SCHEMA, build_frames, page_row,
+                     product_rows, write_parquet)
 from .sources import ScrapeSources, build_sources, chat_brands_for, mentions_for
 from .synthetic import make_corpus
 
@@ -41,7 +52,6 @@ from .synthetic import make_corpus
 # Source resolution
 # --------------------------------------------------------------------------- #
 def _load_cache_corpus(cfg: ScrapeConfig, urls: List[str]) -> Dict[str, str]:
-    import json
     corpus: Dict[str, str] = {}
     for url in urls:
         path = _cache_path(cfg, url)
@@ -57,7 +67,7 @@ def _load_cache_corpus(cfg: ScrapeConfig, urls: List[str]) -> Dict[str, str]:
 def _resolve_sources(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> ScrapeSources:
     if sources is not None:
         return sources
-    if os.path.isdir(cfg.clickstream_dir):
+    if os.path.exists(cfg.clickstream_dir):
         real = build_sources(cfg)
         if real is not None and not real.urls.empty:
             if cfg.offline and real.html_by_url is None:
@@ -67,6 +77,37 @@ def _resolve_sources(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None)
         return make_corpus(cfg.synthetic_n_pages, cfg.synthetic_seed)
     raise FileNotFoundError(
         f"No clickstream data at {cfg.clickstream_dir} and use_synthetic_if_missing=False")
+
+
+# --------------------------------------------------------------------------- #
+# Incremental persistence (JSONL sidecar + parquet snapshots)
+# --------------------------------------------------------------------------- #
+def _load_jsonl(path: str) -> List[dict]:
+    """Read a JSONL file, tolerating a torn final line from a crash."""
+    rows: List[dict] = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def _load_resume_state(cfg: ScrapeConfig) -> Tuple[List[dict], List[dict]]:
+    """Previously completed (page_rows, product_rows); products whose page line
+    never landed (crash between the two writes) are dropped so the page's
+    re-scrape can't duplicate them."""
+    pages = _load_jsonl(cfg.pages_jsonl_path())
+    done_page_ids = {p.get("page_id") for p in pages}
+    products = [r for r in _load_jsonl(cfg.products_jsonl_path())
+                if r.get("page_id") in done_page_ids]
+    return pages, products
 
 
 # --------------------------------------------------------------------------- #
@@ -81,29 +122,18 @@ def _prior_for(cfg: ScrapeConfig, row: dict) -> dict:
     }
 
 
-def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Dict[str, object]:
-    src = _resolve_sources(cfg, sources)
-    urls_df = src.urls
-    print(f"[sources] {src.source or cfg.clickstream_dir} | urls={len(urls_df)} | "
-          f"turns_with_mentions={len(src.mentions)}")
-
-    fetcher = Fetcher(cfg, html_by_url=src.html_by_url)
-    url_list = urls_df["url"].tolist()
-    results: List[FetchResult] = fetcher.fetch_many(url_list)
-    ok = sum(r.ok for r in results)
-    print(f"[fetch] mode={'offline' if cfg.offline else 'online'} | "
-          f"ok={ok}/{len(results)}")
-
-    page_rows: List[dict] = []
-    product_rows_all: List[dict] = []
-    for (_, row), fr in zip(urls_df.iterrows(), results):
-        row_d = row.to_dict()
-        url = row_d.get("url") or fr.url
+def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
+                 fr: FetchResult) -> Tuple[dict, List[dict]]:
+    """fetch result → (page_row, product_rows). Never raises: any extraction or
+    classification error degrades to an 'unknown' page row so one bad page
+    cannot kill a long run."""
+    url = row_d.get("url") or fr.url
+    try:
         content = extract_page(fr.html, url=url, parser=cfg.html_parser) if fr.ok \
             else PageContent(url=url)
         products = extract_products(content, cfg.max_products_per_page) if fr.ok else []
-        chat_brands = chat_brands_for(row, src.mentions)
-        mentions = mentions_for(row, src.mentions)
+        chat_brands = chat_brands_for(row_d, src.mentions)
+        mentions = mentions_for(row_d, src.mentions)
         cls = classify_page(content, url, cfg, prior=_prior_for(cfg, row_d),
                             n_products=len(products), chat_brands=chat_brands)
         mid = (row_d.get("message_ids") or [""])[0]
@@ -111,16 +141,93 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
                        coincide_threshold=cfg.coincide_threshold,
                        name_threshold=cfg.match_name_threshold)
         pr = page_row(row_d, fr, content, cls, len(products))
-        page_rows.append(pr)
-        product_rows_all.extend(product_rows(pr["page_id"], url, products))
+        return pr, product_rows(pr["page_id"], url, products)
+    except Exception as exc:
+        err = FetchResult(url=url, status=fr.status, http_status=fr.http_status,
+                          final_url=fr.final_url, content_type=fr.content_type,
+                          error=(fr.error + f" | process: {type(exc).__name__}: {exc}").strip(" |"),
+                          fetched_at=fr.fetched_at)
+        pr = page_row(row_d, err, PageContent(url=url),
+                      PageClass(page_category="unknown", method="error"), 0)
+        return pr, []
 
-    pages_df, products_df = build_frames(page_rows, product_rows_all)
+
+def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Dict[str, object]:
+    src = _resolve_sources(cfg, sources)
+    urls_df = src.urls
+    print(f"[sources] {src.source or cfg.clickstream_dir} | urls={len(urls_df)} | "
+          f"turns_with_mentions={len(src.mentions)}")
 
     os.makedirs(cfg.out_dir, exist_ok=True)
-    write_parquet(page_rows, PAGE_SCHEMA, cfg.pages_path())
-    write_parquet(product_rows_all, PRODUCT_SCHEMA, cfg.products_path())
+    page_rows_all, product_rows_all = ([], []) if not cfg.resume else _load_resume_state(cfg)
+    done_urls = {r.get("url") for r in page_rows_all}
+    if not cfg.resume:
+        # a fresh run must not inherit a previous run's lines in the sidecars
+        for p in (cfg.pages_jsonl_path(), cfg.products_jsonl_path()):
+            if os.path.exists(p):
+                os.remove(p)
+    elif done_urls:
+        print(f"[resume] {len(done_urls)} pages already done in "
+              f"{cfg.pages_jsonl_path()} — skipping them")
+
+    row_by_url: Dict[str, dict] = {}
+    pending: List[str] = []
+    for _, row in urls_df.iterrows():
+        d = row.to_dict()
+        u = d.get("url")
+        if not u or u in row_by_url:
+            continue
+        row_by_url[u] = d
+        if u not in done_urls:
+            pending.append(u)
+
+    fetcher = Fetcher(cfg, html_by_url=src.html_by_url)
+    mode = "offline" if cfg.offline else "online"
+    print(f"[fetch] mode={mode} | pending={len(pending)} | workers={cfg.max_workers} | "
+          f"per-url cap={cfg.hard_timeout:.0f}s | line-by-line -> {cfg.pages_jsonl_path()}")
+
+    n_new = n_ok = n_err = 0
+    t_start = time.monotonic()
+    pages_fh = open(cfg.pages_jsonl_path(), "a", encoding="utf-8")
+    products_fh = open(cfg.products_jsonl_path(), "a", encoding="utf-8")
+    try:
+        for fr in fetcher.iter_fetch(pending):
+            row_d = row_by_url.get(fr.url, {"url": fr.url})
+            pr, prods = _process_one(cfg, src, row_d, fr)
+
+            # products first, page line last: the page line is the commit marker
+            for p in prods:
+                products_fh.write(json.dumps(p, ensure_ascii=False, default=str) + "\n")
+            products_fh.flush()
+            pages_fh.write(json.dumps(pr, ensure_ascii=False, default=str) + "\n")
+            pages_fh.flush()
+
+            page_rows_all.append(pr)
+            product_rows_all.extend(prods)
+            n_new += 1
+            n_ok += int(fr.ok)
+            n_err += int(not fr.ok)
+
+            if cfg.progress_every and n_new % cfg.progress_every == 0:
+                el = time.monotonic() - t_start
+                rate = n_new / el if el > 0 else 0.0
+                eta = (len(pending) - n_new) / rate if rate > 0 else float("inf")
+                print(f"[progress] {n_new}/{len(pending)} pages | ok={n_ok} err={n_err} | "
+                      f"{rate:.1f} pages/s | eta {eta/60:.1f} min", flush=True)
+            if cfg.checkpoint_every and n_new % cfg.checkpoint_every == 0:
+                write_parquet(page_rows_all, PAGE_SCHEMA, cfg.pages_path())
+                write_parquet(product_rows_all, PRODUCT_SCHEMA, cfg.products_path())
+                print(f"[checkpoint] parquet refreshed at {len(page_rows_all)} pages", flush=True)
+    finally:
+        pages_fh.close()
+        products_fh.close()
+        # snapshot whatever we have — also on crash/interrupt
+        write_parquet(page_rows_all, PAGE_SCHEMA, cfg.pages_path())
+        write_parquet(product_rows_all, PRODUCT_SCHEMA, cfg.products_path())
+
+    pages_df, products_df = build_frames(page_rows_all, product_rows_all)
     print(f"[export] {cfg.pages_path()} ({len(pages_df)} pages) | "
-          f"{cfg.products_path()} ({len(products_df)} products)")
+          f"{cfg.products_path()} ({len(products_df)} products) | new this run: {n_new}")
 
     dist = pages_df["page_category"].value_counts()
     print("[categories]\n" + dist.to_string())
@@ -132,7 +239,8 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
         print("[eval]", {k: round(v, 3) for k, v in evaluation.items()})
 
     return {"config": asdict(cfg), "sources": src, "pages": pages_df,
-            "products": products_df, "fetch_results": results, "evaluation": evaluation}
+            "products": products_df, "evaluation": evaluation,
+            "n_new": n_new, "n_fetch_errors": n_err}
 
 
 # --------------------------------------------------------------------------- #
@@ -153,7 +261,6 @@ def evaluate(pages: pd.DataFrame, products: pd.DataFrame,
     if len(commerce):
         out["seller_accuracy"] = float((commerce["seller_type"] == commerce["gt_seller_type"]).mean())
 
-    # page-level coincidence: did any product on a page match, vs expectation
     if len(products):
         any_coin = products.groupby("url")["coincides"].any()
     else:
@@ -174,7 +281,8 @@ def evaluate(pages: pd.DataFrame, products: pd.DataFrame,
 def _parse_args(argv=None) -> ScrapeConfig:
     cfg = ScrapeConfig()
     p = argparse.ArgumentParser(description="Scrape + classify surfaced pages, extract products.")
-    p.add_argument("--clickstream-dir", default=cfg.clickstream_dir)
+    p.add_argument("--clickstream-dir", default=cfg.clickstream_dir,
+                   help="Star-schema dir OR a single parquet file (e.g. simweb_input_file.parquet)")
     p.add_argument("--online", action="store_true", help="Actually fetch over the network (default: offline)")
     p.add_argument("--max-urls", type=int, default=cfg.max_urls)
     p.add_argument("--dedupe-by", default=cfg.dedupe_by, choices=["url", "domain"])
@@ -182,6 +290,13 @@ def _parse_args(argv=None) -> ScrapeConfig:
     p.add_argument("--classifier", default=cfg.classifier, choices=["auto", "rule", "llm", "embed"])
     p.add_argument("--parser", default=cfg.html_parser, choices=["auto", "stdlib", "bs4"])
     p.add_argument("--synthetic-pages", type=int, default=cfg.synthetic_n_pages)
+    p.add_argument("--timeout", type=float, default=cfg.timeout, help="Socket timeout per request (s)")
+    p.add_argument("--hard-timeout", type=float, default=cfg.hard_timeout,
+                   help="Wall-clock cap per URL incl. robots + retries (s)")
+    p.add_argument("--checkpoint-every", type=int, default=cfg.checkpoint_every)
+    p.add_argument("--progress-every", type=int, default=cfg.progress_every)
+    p.add_argument("--no-resume", action="store_true",
+                   help="Ignore + clear the JSONL sidecars instead of resuming")
     p.add_argument("--no-cache", action="store_true")
     p.add_argument("--out-dir", default=cfg.out_dir)
     a = p.parse_args(argv)
@@ -189,7 +304,9 @@ def _parse_args(argv=None) -> ScrapeConfig:
         clickstream_dir=a.clickstream_dir, offline=not a.online, max_urls=a.max_urls,
         dedupe_by=a.dedupe_by, only_recommended=a.only_recommended, classifier=a.classifier,
         html_parser=a.parser, synthetic_n_pages=a.synthetic_pages,
-        use_cache=not a.no_cache, out_dir=a.out_dir,
+        timeout=a.timeout, hard_timeout=a.hard_timeout,
+        checkpoint_every=a.checkpoint_every, progress_every=a.progress_every,
+        resume=not a.no_resume, use_cache=not a.no_cache, out_dir=a.out_dir,
     )
 
 

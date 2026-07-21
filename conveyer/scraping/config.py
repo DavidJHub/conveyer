@@ -70,6 +70,9 @@ class ScrapeConfig:
     cache_dir: str = "outputs/scrape_cache"
     use_cache: bool = True
     allowed_content_types: Tuple[str, ...] = ("text/html", "application/xhtml+xml")
+    base_fallback: bool = True           # when a deep link is unreachable, fetch
+                                         # scheme://host/ and classify from the
+                                         # base page + the original URL's tokens
 
     # --- Parsing / extraction ----------------------------------------------- #
     html_parser: str = "auto"            # auto | stdlib | bs4 (auto prefers bs4 if installed)

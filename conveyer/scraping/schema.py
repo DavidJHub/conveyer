@@ -43,7 +43,8 @@ PAGE_SCHEMA = pa.schema([
     ("digital_site_id", _I64),
     # fetch
     ("fetch_status", _S), ("http_status", _I32), ("content_type", _S),
-    ("fetched_at", _S), ("fetch_error", _S), ("from_cache", _B), ("parser", _S),
+    ("fetched_at", _S), ("fetch_error", _S), ("from_cache", _B),
+    ("fetch_scope", _S), ("parser", _S),
     # extracted page info
     ("lang", _S), ("title", _S), ("meta_description", _S), ("h1", _S),
     ("canonical_url", _S), ("og_type", _S), ("og_site_name", _S),
@@ -102,7 +103,7 @@ def _as_int(x) -> Optional[int]:
 # Row assembly
 # --------------------------------------------------------------------------- #
 def page_row(url_row: dict, fetch: FetchResult, content: PageContent,
-             cls: PageClass, n_products: int) -> dict:
+             cls: PageClass, n_products: int, fetch_scope: str = "page") -> dict:
     url = url_row.get("url") or fetch.url
     u = parse_url(url)
     return {
@@ -120,6 +121,7 @@ def page_row(url_row: dict, fetch: FetchResult, content: PageContent,
         "fetched_at": fetch.fetched_at,
         "fetch_error": fetch.error,
         "from_cache": bool(fetch.from_cache),
+        "fetch_scope": fetch_scope,
         "parser": content.parser,
         "lang": content.lang,
         "title": content.title,

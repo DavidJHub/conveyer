@@ -348,6 +348,31 @@ def test_throttle_is_per_domain_not_global():
     _check(time.monotonic() - t1 >= 0.4, "same domain must be rate-limited")
 
 
+def test_base_url_fallback():
+    """An unreachable deep link on an unknown domain must fall back to the base
+    page (scheme://host/) for content, classify from base content + original
+    URL tokens, and record fetch_scope='base'."""
+    out = tempfile.mkdtemp(prefix="conveyer_basefb_")
+    try:
+        art = run_scrape(ScrapeConfig(synthetic_n_pages=30, out_dir=out, progress_every=0))
+        pages = art["pages"]
+        indie = pages[pages["url"].str.contains("glowessence")]
+        _check(len(indie) > 0, "indie base-fallback pages present in corpus")
+        _check((indie["fetch_scope"] == "base").all(),
+               f"scope should be base: {indie['fetch_scope'].unique()}")
+        _check((indie["page_category"] == "shopping").all(),
+               f"base content + pdp URL -> shopping: {indie['page_category'].unique()}")
+        _check(indie["is_study_relevant"].all(), "base content supplies topical evidence")
+        _check(indie["classification_signals"].apply(lambda s: "base_content" in list(s)).all(),
+               "base_content signal recorded")
+        # products must never be attributed from a stand-in base page
+        prods = art["products"]
+        _check(not prods["url"].str.contains("glowessence").any(),
+               "no products attributed from base pages")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- #
 # Incremental persistence & resume
 # --------------------------------------------------------------------------- #

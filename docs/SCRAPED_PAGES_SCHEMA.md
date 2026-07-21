@@ -1,16 +1,16 @@
-# Schema — scraped surfaced pages (`conveyer.scraping`)
+# Schema — scraped surfaced pages (`conveyer.scraping`, module 2)
 
-The dataframe the user-facing question asked for: every URL surfaced during the
-skincare conversations (the link columns of the SimilarWeb clickstream star
-schema — see [`DATA_DICTIONARY.md`](DATA_DICTIONARY.md) §2), scraped, classified
-into funnel-mapped page categories, with the products found on each page
-extracted and matched back to the product the agent mentioned in the chat.
+Every URL surfaced during the conversations — the `a_links_source` /
+`ai_click` / `next_10_urls` columns of the conversations parquet (see
+[`DATA_DICTIONARY.md`](DATA_DICTIONARY.md) §0) — scraped, classified into
+funnel-mapped page categories, with the products found on each page extracted
+and matched back to the brands the agent mentioned in the chat.
 
 Produced as a **two-table parquet star**:
 
 | File (default path) | Grain | Rows come from |
 |---|---|---|
-| `outputs/scrape/scraped_pages.parquet` (`fact_scraped_page`) | one **URL** | `dim_digital_site.url` ∪ `fact_ai_click_through.surfaced_url` ∪ `simweb_input_file.{a_links_source, next_10_urls, ai_click}` |
+| `outputs/scrape/scraped_pages.parquet` (`fact_scraped_page`) | one **URL** | the conversation link columns: `a_links_source` ∪ `ai_click` ∪ `next_10_urls` (plus the SimilarWeb star-schema tables when a directory of them is pointed at) |
 | `outputs/scrape/scraped_products.parquet` (`fact_scraped_product`) | one **product found on a page** | schema.org `Product` JSON-LD → OpenGraph `product:*` → microdata → visible-price heuristic |
 
 Each parquet has a **`.jsonl` sidecar** (same basename): the pipeline appends
@@ -23,13 +23,12 @@ Regenerate with `python -m conveyer.scraping` (offline synthetic corpus) or,
 online, from the star-schema directory **or the raw input file alone**:
 
 ```bash
-python -m conveyer.scraping \
-    --clickstream-dir data/similarweb_clickstream_data/simweb_input_file.parquet \
+python -m conveyer.scraping --clickstream-dir data/conversations.parquet \
     --online --max-urls 2000 --hard-timeout 30
 ```
 
 Demo + profiling:
-[`notebooks/05_page_scraping.ipynb`](../notebooks/05_page_scraping.ipynb).
+[`notebooks/02_page_classifier.ipynb`](../notebooks/02_page_classifier.ipynb).
 
 ---
 
@@ -63,15 +62,20 @@ distribution (search 46k · marketplace 6.7k · category 6.4k rows) plus the
 editorial/community pages that dominate skincare discovery don't fit the three
 requested buckets, and each occupies a distinct funnel position.
 
-**The classifier is multimodal.** Four independent evidence channels vote —
-URL tokens (`/cart/`, `checkout`, `/dp/…`, `?q=`), domain knowledge (curated
-retailer / search / community / editorial / reference / brand lists),
-page content & markup (schema.org, OpenGraph, price/cart signals), and the
-vendor prior — and **any one can carry a page alone**.
-`classification_signals` records which fired. So
+**The classifier is multimodal, with a fallback chain.** Four independent
+evidence channels vote — URL tokens (`/cart/`, `checkout`, `/dp/…`, `?q=`),
+domain knowledge (curated retailer / search / community / editorial /
+reference / brand lists, brand domains from `conveyer.brands`), page content &
+markup (schema.org, OpenGraph, price/cart signals), and the vendor prior when
+present — and **any one can carry a page alone**. When the page itself is
+unreachable, the fetcher falls back to the **base URL** (`scheme://host/`,
+`fetch_scope="base"`) so domain-level content still informs relevance; when
+that fails too, URL + domain heuristics decide alone (`fetch_scope="none"`).
+`classification_signals` records which modalities fired. So
 `amazon.com/gp/cart/view.html?ref_=nav_cart` classifies as
 `shopping · cart · retailer · Purchase` with zero fetched content: the domain
-says retailer, the path says cart.
+says retailer, the path says cart. Products are only ever extracted from the
+page itself — a base page's markup is never attributed to the deep link.
 
 **Topical relevance is a separate judgement from page structure**, with
 collapse rules that respect what each modality can know:
@@ -137,7 +141,7 @@ erDiagram
 
 ---
 
-## 3 · `fact_scraped_page` — 56 columns (grain = one URL)
+## 3 · `fact_scraped_page` — 57 columns (grain = one URL)
 
 ### Identity & URL parts
 
@@ -160,6 +164,7 @@ erDiagram
 | `fetched_at` | string | UTC ISO timestamp |
 | `fetch_error` | string | error detail when `fetch_status != ok` |
 | `from_cache` | bool | served from the on-disk fetch cache |
+| `fetch_scope` | string | where the content came from: `page` (the URL itself) · `base` (**base-URL fallback** — the deep link was unreachable, so `scheme://host/` was fetched instead and stands in for domain-level evidence; `x.com/…/status/…` → `x.com/`) · `none` (URL/domain heuristics only) |
 | `parser` | string | `stdlib` or `bs4` (auto-upgrades when installed) |
 
 ### Extracted page info ("all the info of the web page we can")
@@ -186,7 +191,7 @@ erDiagram
 | `seller_type` | string | `brand_owned · retailer · na` |
 | `funnel_stage` | string | Awareness … Post-Purchase / Irrelevant |
 | `classifier_method` | string | `rule · rule+prior · llm · error` |
-| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · prior · llm` |
+| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · base_content · prior · llm` |
 | `skincare_relevance` | float64 | 0–1 topical score (keywords + brands, in content **and** URL slugs) |
 | `is_study_relevant` | bool | `skincare_relevance ≥ 0.15`, or journey infrastructure (topic-neutral subtype on a known domain) |
 | `primary_brand` | string | page-intrinsic brand (brand domain or `product:brand`) |

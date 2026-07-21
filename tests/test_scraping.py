@@ -166,13 +166,25 @@ def test_multimodal_url_only():
             ("shopping", "cart", "retailer", "Purchase", True),
         "https://www.sephora.com/checkout": ("shopping", "checkout", "retailer", "Purchase", True),
         "https://www.ulta.com/cart": ("shopping", "cart", "retailer", "Purchase", True),
-        # retailer root = storefront entry (browse-many), not a brand landing
+        "https://www.amazon.com/gp/aw/c": ("shopping", "cart", "retailer", "Purchase", True),
+        # transactional tokens are self-evident commerce on ANY domain —
+        # /checkouts/c/<token> must also beat the single-letter /c/ collection vote
+        "https://glowlab.myshopify.com/checkouts/c/0a1b2c3d":
+            ("shopping", "checkout", "na", "Purchase", True),
+        # order history is Post-Purchase infrastructure, wishlist is Intent
+        "https://www.amazon.com/gp/css/order-history":
+            ("shopping", "order", "retailer", "Post-Purchase", True),
+        "https://www.amazon.com/hz/wishlist/ls/ABCD123":
+            ("shopping", "wishlist", "retailer", "Intent", True),
+        # retailer roots (incl. locale roots) = storefront entry, not a brand landing
         "https://www.amazon.com/": ("catalogue", "marketplace", "retailer", "Discovery", True),
+        "https://www.target.com/us": ("catalogue", "marketplace", "retailer", "Discovery", True),
         # opaque ASIN PDP: role holds from URL+domain; the product (and hence
         # topicality) stays unknown -> not study-relevant until fetched
         "https://www.amazon.com/dp/B00365FJ8K": ("shopping", "pdp", "retailer", "Intent", False),
-        # search engine, whatever the query
-        "https://www.google.com/search?q=anything+at+all": ("search", "serp", "na", "Intent", True),
+        # a SERP that exposes its query is judged by the query text
+        "https://www.google.com/search?q=best+gaming+laptops": ("search", "serp", "na", "Intent", False),
+        "https://www.google.com/search?q=best+retinol": ("search", "serp", "na", "Intent", True),
     }
     for u, (cat, sub, seller, funnel, relevant) in cases.items():
         r = classify_rule(extract_page("", u), u, cfg)
@@ -180,10 +192,30 @@ def test_multimodal_url_only():
         _check(r.page_subtype == sub, f"{u} subtype {r.page_subtype} (want {sub})")
         _check(r.seller_type == seller, f"{u} seller {r.seller_type} (want {seller})")
         _check(r.funnel_stage == funnel, f"{u} funnel {r.funnel_stage} (want {funnel})")
-        _check("domain" in r.signals and "url" in r.signals,
-               f"{u} signals {r.signals} must include url+domain")
+        _check("url" in r.signals, f"{u} signals {r.signals} must include url")
         _check(r.is_study_relevant == relevant,
                f"{u}: is_study_relevant={r.is_study_relevant} (want {relevant})")
+
+
+def test_neutrality_must_be_earned():
+    """The weak retailer catch-all votes (listing 0.6 / marketplace 1.2) must
+    not turn /careers, /help or /prime into relevant journey pages."""
+    cfg = ScrapeConfig()
+    for u in ("https://www.sephora.com/careers", "https://www.amazon.com/prime",
+              "https://www.walmart.com/help"):
+        r = classify_rule(extract_page("", u), u, cfg)
+        _check(r.page_category == "unknown", f"{u} -> {r.page_category} (want unknown)")
+        _check(not r.is_study_relevant, f"{u} must not be study-relevant")
+    # with fetched off-topic content the judgement hardens to 'unrelated'
+    jobs = ("<html><head><title>Careers at Sephora</title></head><body><h1>Careers</h1>"
+            "<p>Join our team. Open roles in engineering and retail operations.</p></body></html>")
+    u = "https://www.sephora.com/careers"
+    r = classify_rule(extract_page(jobs, u), u, cfg)
+    _check(r.page_category == "unrelated", f"fetched careers -> {r.page_category}")
+    # an 'unknown' page with a cart-ish path must not be staged Purchase
+    from conveyer.scraping.taxonomy import funnel_stage_for
+    _check(funnel_stage_for("unknown", "cart") == "Irrelevant", "no Purchase bump off-shopping")
+    _check(funnel_stage_for("shopping", "order") == "Post-Purchase", "order stage")
 
 
 # --------------------------------------------------------------------------- #

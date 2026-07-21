@@ -26,15 +26,21 @@ auditable. An optional LLM pass (``classifier="llm"`` / ``"auto"`` when
 Topical relevance is a **separate axis** from page structure, with collapse
 rules that respect what each modality can know:
 
-* **topic-neutral subtypes** (cart, checkout, search results, marketplace and
-  storefront homepages) carry no topical tokens *by nature* — they are journey
-  infrastructure and are never collapsed for lacking skincare evidence;
+* **topic-neutral subtypes** (cart, checkout, order, search results,
+  marketplace and storefront homepages) carry no topical tokens *by nature* —
+  journey infrastructure, never collapsed for lacking skincare evidence. But
+  neutrality must be *earned* by a structural vote (URL/markup/prior or a
+  decisive domain role): the weak retailer catch-all does not turn
+  ``sephora.com/careers`` into a journey page, and a SERP whose URL exposes
+  its query is judged by the query text instead;
+* **transactional URL tokens are self-evident commerce** on any domain — an
+  unfetchable ``/checkouts/c/<token>`` on an unheard-of store is a checkout;
 * **topical subtypes** (PDP, article, …) *with* fetched content and no skincare
   signal collapse to ``unrelated`` (a confident judgement);
-* topical subtypes *without* content keep their structural category when the
-  domain is a known one (an unfetched ``amazon.com/dp/…`` is still a shopping
-  page — for *which* product is what ``is_study_relevant`` tracks), and fall
-  to ``unknown`` only when the domain tells us nothing either.
+* topical subtypes *without* content keep their *earned* structural category
+  when the domain is a known one (an unfetched ``amazon.com/dp/…`` is still a
+  shopping page — for *which* product is what ``is_study_relevant`` tracks),
+  and fall to ``unknown`` when nothing earns the role.
 """
 
 from __future__ import annotations
@@ -173,9 +179,15 @@ class PageClass:
 
 # Subtypes that carry no topical tokens by nature — journey infrastructure.
 # Lack of skincare evidence must never collapse these (an Amazon cart URL says
-# nothing about skincare and never will).
-TOPIC_NEUTRAL_SUBTYPES = {"cart", "checkout", "serp", "site_search",
-                          "marketplace", "homepage", "listing"}
+# nothing about skincare and never will). Neutrality must be *earned* by a
+# structural vote (URL/markup/prior, or a decisive domain role) — the weak
+# retailer catch-all votes must not turn /careers or /help into journey pages.
+TOPIC_NEUTRAL_SUBTYPES = {"cart", "checkout", "order", "serp", "site_search",
+                          "marketplace", "homepage"}
+
+# URL-token transactional subtypes are commerce infrastructure wherever they
+# live: /checkouts/c/<token> on an unheard-of Shopify store is still a checkout.
+TRANSACTIONAL_SUBTYPES = {"cart", "checkout", "order", "wishlist"}
 
 
 def _known_domain(u: UrlParts) -> bool:
@@ -191,6 +203,11 @@ def _known_domain(u: UrlParts) -> bool:
 # --------------------------------------------------------------------------- #
 # Rule scorer
 # --------------------------------------------------------------------------- #
+# Root-ish paths, shared by the homepage rule and the retailer-root boost so a
+# locale root (/us, /en-us) never reads differently from "/".
+_ROOT_PATHS = ("", "/", "/index.html", "/home", "/us", "/en", "/en-us")
+
+
 def _url_subtype_votes(u: UrlParts) -> Dict[str, float]:
     """Vote for structural subtypes from the URL path/query."""
     v: Dict[str, float] = {}
@@ -199,21 +216,28 @@ def _url_subtype_votes(u: UrlParts) -> Dict[str, float]:
     def add(sub, w):
         v[sub] = v.get(sub, 0.0) + w
 
-    if path in ("", "/", "/index.html", "/home", "/us", "/en", "/en-us"):
+    if path in _ROOT_PATHS:
         add("homepage", 2.0)
     if re.search(r"/(dp|gp/product|ip|product|products|p|prod|pd|itm)(/|$|-)", path) or \
        re.search(r"[?&](sku|productid|pid|asin)=", "?" + q):
         add("pdp", 2.0)
     if re.search(r"/(collections?|categor(y|ies)|shop|browse|store|c|b|departments?)(/|$)", path):
         add("collection", 1.6)
-    # cart/checkout: transactional tokens are decisive wherever they appear —
-    # /gp/cart/view.html, /checkout/p/..., basket.jsp, ?ref_=nav_cart
-    if re.search(r"/(cart|basket|bag|wishlist)(/|$|\.)", path) or "/gp/cart" in path:
+    # cart/checkout/order: transactional tokens are decisive wherever they
+    # appear — /gp/cart/view.html, /checkouts/c/<token>, basket.jsp, /gp/aw/c
+    # (amazon mobile cart), ?ref_=nav_cart — and must outvote the single-letter
+    # /c/ collection token (1.6).
+    if re.search(r"/(cart|basket|(shopping-)?bag)(/|$|\.)", path) \
+            or "/gp/cart" in path or "/gp/aw/c" in path:
         add("cart", 2.5)
-    if re.search(r"/(checkout|payments?|buy)(/|$|\.)", path) or "/gp/buy" in path:
+    if re.search(r"/(checkouts?|payments?|buy)(/|$|\.)", path) or "/gp/buy" in path:
         add("checkout", 2.5)
     elif "checkout" in path:
-        add("checkout", 1.5)
+        add("checkout", 1.8)
+    if re.search(r"/(orders?|order-history|purchase-history)(/|$|\.)", path):
+        add("order", 2.2)
+    if re.search(r"/wishlist(/|$|\.)", path) or "/hz/wishlist" in path:
+        add("wishlist", 2.2)
     if re.search(r"(^|[?&_=-])cart\b", q):
         add("cart", 1.0)          # e.g. ref_=nav_cart
     if "checkout" in q:
@@ -250,7 +274,7 @@ def _domain_votes(u: UrlParts, page: PageContent, chat_brands: set) -> Dict[str,
         add("listing", 0.6)     # retailer, exact role decided by path/markup
         # a retailer's root page is its storefront entry (browse-many), not a
         # brand landing page — outvote the generic "homepage" reading
-        if u.path in ("", "/", "/index.html"):
+        if u.path in _ROOT_PATHS:
             add("marketplace", 2.6)
     # brand-owned: known brand domain, or the domain core matches a brand the
     # chat recommended / the page's own product brand
@@ -380,11 +404,24 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
 
     relevance = _skincare_relevance(page, u, chat_brands,
                                     str(prior.get(cfg.col_site_category, "")))
-    neutral = subtype in TOPIC_NEUTRAL_SUBTYPES
     known = _known_domain(u)
-    # journey infrastructure (a cart on a known retailer, a SERP, a storefront
-    # entry) is relevant to the journey by virtue of being *in* it
-    is_relevant = relevance >= 0.15 or (neutral and known)
+    # the winning subtype must be *earned* by structural evidence: a URL/markup
+    # vote, a matching vendor prior, or a decisive domain role (>= 2.0 — search
+    # engine, community, editorial, reference, storefront root). The retailer
+    # catch-alls (listing 0.6, bare marketplace 1.2) earn nothing on their own.
+    prior_sub = SIMILARWEB_PAGE_TYPE_TO_SUBTYPE.get(prior_page_type) if prior_fired else None
+    earned = (subtype in modality_votes["url"] or subtype in modality_votes["markup"]
+              or subtype == prior_sub or modality_votes["domain"].get(subtype, 0.0) >= 2.0)
+    # a SERP whose URL exposes the query is NOT topic-neutral — the query text
+    # itself decides relevance (q=best+retinol vs q=gaming+laptops)
+    serp_with_query = subtype in ("serp", "site_search") and \
+        re.search(r"[?&](q|k|query|search|keyword)=[^&]+", "?" + u.query)
+    neutral = subtype in TOPIC_NEUTRAL_SUBTYPES and earned and not serp_with_query
+    # transactional URL tokens are self-evident commerce, known domain or not
+    self_evident = subtype in TRANSACTIONAL_SUBTYPES and subtype in modality_votes["url"]
+    # journey infrastructure (a cart on a known retailer, a storefront entry)
+    # is relevant to the journey by virtue of being *in* it
+    is_relevant = relevance >= 0.15 or (neutral and known) or self_evident
 
     # seller type (only meaningful for commerce categories)
     seller = "na"
@@ -398,15 +435,15 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
 
     # topical relevance overrides the headline bucket (user's "unrelated" case).
     # "unrelated" is a *confident* judgement — it needs fetched content to
-    # stand on. Without content, the domain modality stands in: a known
-    # domain's structural role holds (an unfetched amazon.com/dp/… is still a
-    # shopping page); only a no-content page on an unknown domain is "unknown".
-    # Topic-neutral subtypes were already exempted above.
+    # stand on. Without content, an *earned* structural role stands in: an
+    # unfetched amazon.com/dp/… is still a shopping page, an unfetched
+    # /checkouts/c/<token> is still a checkout. A page whose only support is
+    # the retailer catch-all (sephora.com/careers) tells us nothing → unknown.
     final_category = category
     if not is_relevant and category != "unknown":
         if has_content:
             final_category = "unrelated"
-        elif not known:
+        elif not (earned and (known or self_evident)):
             final_category = "unknown"
 
     # page-intrinsic brand (the brand this page is *about*) — used for matching.

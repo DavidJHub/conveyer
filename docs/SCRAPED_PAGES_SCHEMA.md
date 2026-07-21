@@ -76,22 +76,34 @@ says retailer, the path says cart.
 **Topical relevance is a separate judgement from page structure**, with
 collapse rules that respect what each modality can know:
 
-* **topic-neutral subtypes** (cart, checkout, SERP, marketplace/storefront
-  entry) carry no topical tokens by nature — journey infrastructure, never
-  demoted for lacking skincare evidence;
+* **topic-neutral subtypes** (cart, checkout, order, SERP, marketplace /
+  storefront entry) carry no topical tokens by nature — journey
+  infrastructure, never demoted for lacking skincare evidence. Neutrality
+  must be **earned** by a structural vote (URL tokens, markup, the vendor
+  prior, or a decisive domain role) — the weak retailer catch-all vote does
+  not qualify, so `sephora.com/careers` or `amazon.com/prime` stay `unknown`
+  rather than becoming "relevant catalogue" pages. A SERP whose URL exposes
+  its query is judged by the query text instead (`q=best+retinol` is
+  relevant, `q=gaming+laptops` is not);
+* **transactional URL tokens are self-evident commerce** on *any* domain: an
+  unfetchable `/checkouts/c/<token>` on an unheard-of Shopify store is still
+  `shopping · checkout · Purchase`;
 * a topical page (PDP, article, …) **with fetched content** and no skincare
   signal → `unrelated` (a confident judgement; `page_subtype` keeps the
   structural reading, so no information is destroyed);
-* a topical page **without content** on a *known* domain keeps its structural
-  category (an unfetched `amazon.com/dp/…` is still a shopping page) with
-  `is_study_relevant = false` until evidence arrives; on an unknown domain it
-  stays `unknown`.
+* a topical page **without content** keeps its *earned* structural category on
+  a known domain (an unfetched `amazon.com/dp/…` is still a shopping page)
+  with `is_study_relevant = false` until evidence arrives; with no earned
+  role, or on an unknown domain, it stays `unknown`.
 
 `page_subtype` (structural): `homepage · landing · brand_site · collection ·
-category · marketplace · listing · pdp · cart · checkout · article · review ·
-listicle · serp · site_search · forum · social · qa · wiki · health · howto ·
-other`. The vendor's `page_type` maps onto these
+category · marketplace · listing · pdp · cart · checkout · order · wishlist ·
+article · review · listicle · serp · site_search · forum · social · qa · wiki ·
+health · howto · other`. The vendor's `page_type` maps onto these
 (`taxonomy.SIMILARWEB_PAGE_TYPE_TO_SUBTYPE`) and acts as a classifier prior.
+Funnel bumps: `cart`/`checkout` → Purchase and `order` → Post-Purchase, applied
+only to real `shopping` pages; `wishlist` stays Intent (saved-for-later is not
+a purchase event).
 
 ---
 
@@ -125,7 +137,7 @@ erDiagram
 
 ---
 
-## 3 · `fact_scraped_page` — 52 columns (grain = one URL)
+## 3 · `fact_scraped_page` — 56 columns (grain = one URL)
 
 ### Identity & URL parts
 

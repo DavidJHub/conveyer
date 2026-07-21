@@ -232,10 +232,12 @@ from conveyer.scraping.extract import extract_page
 
 url_only = [
     "https://www.amazon.com/gp/cart/view.html?ref_=nav_cart",   # retailer cart
-    "https://www.sephora.com/checkout",                          # retailer checkout
+    "https://glowlab.myshopify.com/checkouts/c/0a1b2c3d",        # checkout on an unknown store
+    "https://www.amazon.com/gp/css/order-history",               # post-purchase infrastructure
     "https://www.amazon.com/",                                   # storefront entry
     "https://www.amazon.com/dp/B00365FJ8K",                      # opaque PDP
-    "https://www.google.com/search?q=best+retinol",              # SERP
+    "https://www.sephora.com/careers",                           # catch-all earns nothing
+    "https://www.google.com/search?q=best+retinol",              # SERP judged by its query
     "https://www.reddit.com/r/SkincareAddiction/comments/1/x",   # community
     "https://someblog-nobody-knows.xyz/post/123",                # nothing to go on
 ]

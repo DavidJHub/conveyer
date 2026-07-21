@@ -13,9 +13,22 @@ Produced as a **two-table parquet star**:
 | `outputs/scrape/scraped_pages.parquet` (`fact_scraped_page`) | one **URL** | `dim_digital_site.url` ∪ `fact_ai_click_through.surfaced_url` ∪ `simweb_input_file.{a_links_source, next_10_urls, ai_click}` |
 | `outputs/scrape/scraped_products.parquet` (`fact_scraped_product`) | one **product found on a page** | schema.org `Product` JSON-LD → OpenGraph `product:*` → microdata → visible-price heuristic |
 
-Regenerate with `python -m conveyer.scraping` (offline synthetic corpus) or
-`python -m conveyer.scraping --clickstream-dir data/similarweb_clickstream_data
---online` (real URLs, polite fetching). Demo + profiling:
+Each parquet has a **`.jsonl` sidecar** (same basename): the pipeline appends
+one line per record *the moment a page finishes* (products first, then the
+page line as the commit marker), refreshes the parquet at checkpoints and on
+exit, and — with `resume=True` (default) — a re-run skips everything already in
+the sidecar. A crash or Ctrl-C loses at most the page in flight.
+
+Regenerate with `python -m conveyer.scraping` (offline synthetic corpus) or,
+online, from the star-schema directory **or the raw input file alone**:
+
+```bash
+python -m conveyer.scraping \
+    --clickstream-dir data/similarweb_clickstream_data/simweb_input_file.parquet \
+    --online --max-urls 2000 --hard-timeout 30
+```
+
+Demo + profiling:
 [`notebooks/05_page_scraping.ipynb`](../notebooks/05_page_scraping.ipynb).
 
 ---
@@ -151,10 +164,12 @@ erDiagram
 | column | type | description |
 |---|---|---|
 | `source_tables` | list\<string\> | which link columns surfaced it (`click_through · a_links_source · next_10_urls · ai_click`) |
-| `times_surfaced` / `times_recommended` / `times_visited` | int32 | event counts from `fact_ai_click_through` |
+| `times_surfaced` / `times_recommended` / `times_visited` | int32 | event counts (`a_links_source` counts as recommended; trail/`ai_click` entries as visited) |
 | `resulted_in_purchase_any` | bool | any surfacing event ended in a purchase flag |
 | `n_message_ids` / `message_ids` | int32 / list\<string\> | the turns this URL attaches to |
 | `prior_page_type` / `prior_seller_type` / `prior_retailer_brand` / `prior_site_category` | string | the `dim_digital_site` weak labels, kept verbatim for audit (`""` when absent) |
+| `mean_dwell_seconds` / `total_dwell_seconds` | float64 (nullable) | attention from the browsing trail: the `request_time` gap until the user's *next* request, averaged / summed over this URL's trail appearances. The **last** trail entry has no successor, so it never contributes (null when the URL was never dwelt on). Upper bound on attention — idle time counts |
+| `mean_trail_position` | float64 (nullable) | average 1-based slot in the post-turn trail (1 = the first page opened after the answer) |
 
 ---
 
@@ -209,13 +224,28 @@ erDiagram
    certifies the plumbing and rules, **not** real-world accuracy; on real pages
    expect degradation from JS-rendered content (no headless browser), bot
    walls, and unmarked-up products.
-3. **Offline by default.** Nothing touches the network unless
-   `ScrapeConfig(offline=False)` / `--online`. Online mode obeys robots.txt,
-   rate-limits per domain, retries with backoff, caps body size and caches
-   every fetch under `outputs/scrape_cache/`.
-4. **The vendor prior is a prior, not truth.** `prior_page_type` disagrees with
+3. **Offline by default; online mode cannot hang.** Nothing touches the
+   network unless `ScrapeConfig(offline=False)` / `--online`. Online, every
+   URL runs under a **wall-clock budget** (`hard_timeout`, default 30s)
+   covering robots.txt (fetched with a bounded timeout — the stdlib reader
+   blocks forever on dead hosts), all retries, and slow-dribbling bodies that
+   a socket `timeout` alone cannot stop. The per-domain rate limiter reserves
+   a slot and sleeps *outside* the lock, so one slow domain never stalls the
+   other workers. Everything is cached under `outputs/scrape_cache/`.
+4. **Incremental by construction.** Results stream in completion order into
+   the `.jsonl` sidecars (one line per record; the page line is the commit
+   marker), with `[progress]` lines reporting throughput/ETA; parquet is a
+   periodic snapshot. Interrupt at any time; the next run resumes.
+5. **Input-file-only mode.** With just `simweb_input_file.parquet`, URLs and
+   dwell come from `next_10_urls`/`a_links_source`/`ai_click`; there is no
+   vendor prior (`prior_* = ""`) and no entity table, so product↔chat matching
+   reports `match_type = "none"` until `fact_ai_recommendation` +
+   `fact_ai_concept` are added.
+6. **Dwell is attention's upper bound.** The gap includes idle/tab-away time;
+   the last trail entry never gets a dwell (no successor to measure against).
+7. **The vendor prior is a prior, not truth.** `prior_page_type` disagrees with
    the classifier on genuinely ambiguous pages; both are kept so the
    disagreement is auditable (`classifier_method` tells you when the prior was
    blended in).
-5. **String `"None"` normalisation** from `dim_digital_site` is applied when
+8. **String `"None"` normalisation** from `dim_digital_site` is applied when
    building the candidate table (prior columns arrive clean or `""`).

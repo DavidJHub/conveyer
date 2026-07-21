@@ -17,18 +17,29 @@ provenance counts and the vendor prior) and a **mentions map**
 ``message_id → [RecMention]`` built from ``fact_ai_recommendation`` +
 ``fact_ai_concept`` — the "product mentioned in the chat with the agent" that
 ``conveyer.scraping.products`` matches page products against.
+
+It also works from **``simweb_input_file.parquet`` alone** (point
+``clickstream_dir`` at the file): the trail in ``next_10_urls`` supplies the
+URLs, and the ``request_time`` deltas between consecutive requests supply a
+**dwell-time / retention signal** (`mean_dwell_seconds`,
+`total_dwell_seconds`, `mean_trail_position`) — how long the user stayed on a
+page before moving on. The last trail entry has no successor, so its dwell is
+never guessed.
 """
 
 from __future__ import annotations
 
+import ast
 import glob
+import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
-from ..ingest import normalize, to_list
+from ..ingest import normalize
 from .classify import parse_url
 from .config import ScrapeConfig
 from .products import RecMention
@@ -65,10 +76,18 @@ _TABLE_HINTS = {
 def load_clickstream(cfg: ScrapeConfig) -> Optional[Dict[str, pd.DataFrame]]:
     """Load the clickstream parquet tables from ``cfg.clickstream_dir``.
 
-    Returns None if the directory is absent, so the pipeline can fall back to
-    the synthetic corpus.
+    ``clickstream_dir`` may be the star-schema *directory* or a single parquet
+    *file* (e.g. just ``simweb_input_file.parquet`` — the URLs in
+    ``next_10_urls`` / ``a_links_source`` / ``ai_click`` are enough to run the
+    whole pipeline). Returns None if nothing is found, so the pipeline can fall
+    back to the synthetic corpus.
     """
     d = cfg.clickstream_dir
+    if os.path.isfile(d) and d.endswith(".parquet"):
+        try:
+            return {"input_file": pd.read_parquet(d)}
+        except Exception:
+            return None
     if not os.path.isdir(d):
         return None
     files = glob.glob(os.path.join(d, "*.parquet")) + glob.glob(os.path.join(d, "*", "*.parquet"))
@@ -83,6 +102,78 @@ def load_clickstream(cfg: ScrapeConfig) -> Optional[Dict[str, pd.DataFrame]]:
                     continue
                 break
     return out or None
+
+
+# --------------------------------------------------------------------------- #
+# List-cell coercion + browsing-trail parsing
+# --------------------------------------------------------------------------- #
+def _as_records(cell: Any) -> List[Any]:
+    """Coerce a link-list cell into a plain Python list.
+
+    Real parquet gives ``next_10_urls`` back as a **numpy array of dicts**
+    (``ingest.to_list`` would silently return [] for those); other exports give
+    Python lists, or a stringified repr with single quotes. Handle all of them.
+    """
+    if cell is None:
+        return []
+    if isinstance(cell, np.ndarray):
+        return cell.tolist()
+    if isinstance(cell, (list, tuple)):
+        return list(cell)
+    if isinstance(cell, float) and pd.isna(cell):
+        return []
+    if isinstance(cell, str):
+        s = cell.strip()
+        if not s or s.lower() == "none":
+            return []
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                v = parser(s)
+                if isinstance(v, (list, tuple)):
+                    return list(v)
+                return [v]
+            except (ValueError, SyntaxError):
+                continue
+        return [s]
+    return [cell]
+
+
+def _event_url(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("requested_site") or item.get("url") or "").strip()
+    return str(item or "").strip()
+
+
+def _event_time_ms(item: Any) -> Optional[int]:
+    if not isinstance(item, dict):
+        return None
+    t = item.get("request_time")
+    try:
+        return int(str(t))
+    except (TypeError, ValueError):
+        return None
+
+
+def trail_events(cell: Any) -> List[Dict[str, Any]]:
+    """Parse one ``next_10_urls`` cell into ordered events with dwell times.
+
+    ``dwell_seconds`` for event *i* is the gap until request *i+1* — how long
+    the user stayed before moving on. The **last** event has no successor, so
+    its dwell is None (never guessed). Position is 1-based within the trail.
+    """
+    items = _as_records(cell)
+    events = [{"url": _event_url(it), "t_ms": _event_time_ms(it)} for it in items]
+    events = [e for e in events if e["url"]]
+    if all(e["t_ms"] is not None for e in events) and len(events) > 1:
+        events.sort(key=lambda e: e["t_ms"])
+    out: List[Dict[str, Any]] = []
+    for i, e in enumerate(events):
+        dwell = None
+        if i + 1 < len(events) and e["t_ms"] is not None and events[i + 1]["t_ms"] is not None:
+            delta = (events[i + 1]["t_ms"] - e["t_ms"]) / 1000.0
+            dwell = delta if delta >= 0 else None
+        out.append({"url": e["url"], "position": i + 1, "dwell_seconds": dwell})
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -164,7 +255,7 @@ def candidate_urls(tables: Dict[str, pd.DataFrame], cfg: ScrapeConfig) -> pd.Dat
     rows: Dict[str, dict] = {}
 
     def _bump(url: str, site_id=None, mid=None, recommended=False, visited=False,
-              purchased=False, source="click_through"):
+              purchased=False, source="click_through", dwell=None, position=None):
         url = str(url or "").strip()
         if not url or url.lower() == "none":
             return
@@ -172,6 +263,7 @@ def candidate_urls(tables: Dict[str, pd.DataFrame], cfg: ScrapeConfig) -> pd.Dat
             "url": url, "digital_site_id": site_id, "message_ids": set(),
             "times_surfaced": 0, "times_recommended": 0, "times_visited": 0,
             "resulted_in_purchase_any": False, "sources": set(),
+            "_dwell_sum": 0.0, "_dwell_n": 0, "_pos_sum": 0.0, "_pos_n": 0,
         })
         r["times_surfaced"] += 1
         r["times_recommended"] += int(bool(recommended))
@@ -182,6 +274,12 @@ def candidate_urls(tables: Dict[str, pd.DataFrame], cfg: ScrapeConfig) -> pd.Dat
             r["digital_site_id"] = site_id
         if mid:
             r["message_ids"].add(str(mid))
+        if dwell is not None:
+            r["_dwell_sum"] += float(dwell)
+            r["_dwell_n"] += 1
+        if position is not None:
+            r["_pos_sum"] += float(position)
+            r["_pos_n"] += 1
 
     if click is not None and not click.empty:
         cols = click.columns
@@ -194,25 +292,33 @@ def candidate_urls(tables: Dict[str, pd.DataFrame], cfg: ScrapeConfig) -> pd.Dat
                   purchased=bool(d.get(cfg.col_resulted_in_purchase, False)),
                   source="click_through")
 
-    # answer-cited links + browsing trail from the raw input file
+    # answer-cited links, client-side clicks and the raw browsing trail
     inp = tables.get("input_file")
     if inp is not None and not inp.empty:
-        for col, src in (("a_links_source", "a_links_source"),
-                         ("next_10_urls", "next_10_urls"), ("ai_click", "ai_click")):
+        mids = inp.get(cfg.col_click_message_id, pd.Series([""] * len(inp)))
+        for col, src in (("a_links_source", "a_links_source"), ("ai_click", "ai_click")):
             if col not in inp.columns:
                 continue
-            for mid, cell in zip(inp.get(cfg.col_click_message_id, ""), inp[col]):
-                for item in to_list(cell):
-                    url = item.get("requested_site") if isinstance(item, dict) else item
-                    _bump(url, mid=mid, recommended=(src == "a_links_source"),
-                          source=src)
+            for mid, cell in zip(mids, inp[col]):
+                for item in _as_records(cell):
+                    _bump(_event_url(item), mid=mid,
+                          recommended=(src == "a_links_source"),
+                          visited=(src == "ai_click"), source=src)
+        if "next_10_urls" in inp.columns:
+            # the trail: visited by construction; request_time deltas give the
+            # dwell before the user moved on (relevancy / retention signal)
+            for mid, cell in zip(mids, inp["next_10_urls"]):
+                for ev in trail_events(cell):
+                    _bump(ev["url"], mid=mid, visited=True, source="next_10_urls",
+                          dwell=ev["dwell_seconds"], position=ev["position"])
 
     if not rows:
         return pd.DataFrame(columns=[
             "url", "digital_site_id", "domain", "page_type", "seller_type",
             "retailer_brand", "site_category", "extracted_skus", "message_ids",
             "times_surfaced", "times_recommended", "times_visited",
-            "resulted_in_purchase_any", "sources"])
+            "resulted_in_purchase_any", "sources", "mean_dwell_seconds",
+            "total_dwell_seconds", "mean_trail_position"])
 
     out = []
     for url, r in rows.items():
@@ -233,6 +339,9 @@ def candidate_urls(tables: Dict[str, pd.DataFrame], cfg: ScrapeConfig) -> pd.Dat
             "times_visited": r["times_visited"],
             "resulted_in_purchase_any": r["resulted_in_purchase_any"],
             "sources": sorted(r["sources"]),
+            "mean_dwell_seconds": round(r["_dwell_sum"] / r["_dwell_n"], 3) if r["_dwell_n"] else None,
+            "total_dwell_seconds": round(r["_dwell_sum"], 3) if r["_dwell_n"] else None,
+            "mean_trail_position": round(r["_pos_sum"] / r["_pos_n"], 3) if r["_pos_n"] else None,
         })
     df = pd.DataFrame(out)
 

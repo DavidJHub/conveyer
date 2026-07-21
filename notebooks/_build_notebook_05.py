@@ -29,10 +29,12 @@ md("""
 
 The clickstream dataframes carry **hundreds of thousands of links** — the URLs
 the assistant cited in its answers and the pages users browsed right after each
-turn (`dim_digital_site.url`, `fact_ai_click_through.surfaced_url`,
-`simweb_input_file.a_links_source` / `next_10_urls`). This notebook demonstrates
-`conveyer.scraping`, the module that turns those link columns into an analysable
-dataset:
+turn. When only the raw export is available, everything needed lives in one
+file: **`simweb_input_file.parquet`** (`a_links_source` = links cited in the
+answer, `ai_click` = client-side clicks, and `next_10_urls` = the raw browsing
+trail with per-request timestamps). This notebook demonstrates
+`conveyer.scraping`, the module that turns those link columns into an
+analysable dataset:
 
 1. **Scrape** each URL (politely: robots.txt, per-domain rate limit, cache) and
    extract *everything the page offers* — title, meta/OpenGraph, headings, text,
@@ -53,11 +55,13 @@ dataset:
 
 3. **Extract the products** on each page (price, description, rating, category,
    SKU) and **match them to the product the agent mentioned** on the turn that
-   surfaced the link (`fact_ai_recommendation` + `fact_ai_concept`), yielding a
-   per-product `coincides` verdict.
-4. **Persist** the result as a two-table parquet star with a pinned schema —
-   `fact_scraped_page` + `fact_scraped_product` — documented in
-   [`docs/SCRAPED_PAGES_SCHEMA.md`](../docs/SCRAPED_PAGES_SCHEMA.md).
+   surfaced the link, yielding a per-product `coincides` verdict.
+4. **Persist incrementally** — each finished page is appended to a
+   line-per-record JSONL sidecar the moment it completes, and the two-table
+   parquet star (`fact_scraped_page` + `fact_scraped_product`,
+   [`docs/SCRAPED_PAGES_SCHEMA.md`](../docs/SCRAPED_PAGES_SCHEMA.md)) is
+   refreshed at checkpoints and on exit. **A long run can neither hang nor lose
+   its work** (details in §2).
 
 Like every conveyer module, it runs end-to-end **offline** on a synthetic
 ground-truth corpus when the real data (or the network) is absent — so this
@@ -69,13 +73,22 @@ md("""
 ## 1 · Setup & configuration
 
 `ScrapeConfig` is safe by default: `offline=True` (no network), synthetic
-fallback when `data/similarweb_clickstream_data/` is missing, vendor
-`page_type` prior enabled. Flip `offline=False` (or run
-`python -m conveyer.scraping --online`) for real fetching.
+fallback when no data is present. `clickstream_dir` accepts **either** the
+star-schema directory **or a single parquet file** — pointing it at
+`simweb_input_file.parquet` alone is fully supported.
+
+The knobs that keep a real run bounded:
+
+* `timeout` — socket connect/read timeout per request;
+* `hard_timeout` — **wall-clock cap per URL**, covering robots.txt, every
+  retry and slow-dribbling bodies. A server that keeps trickling bytes never
+  trips a socket timeout — only a wall-clock budget stops it;
+* `checkpoint_every` / `progress_every` — parquet refresh + progress cadence;
+* `resume=True` — a re-run skips every page already in the JSONL sidecar.
 """)
 
 code("""
-import sys, warnings
+import shutil, sys, warnings
 from pathlib import Path
 
 import numpy as np
@@ -90,21 +103,47 @@ warnings.filterwarnings("ignore")
 
 from conveyer.scraping import ScrapeConfig, run_scrape, CATEGORY_DEFINITIONS
 
+DATA = ROOT / "data/similarweb_clickstream_data/simweb_input_file.parquet"
+OUT = ROOT / "outputs/scrape_demo"
+shutil.rmtree(OUT, ignore_errors=True)   # fresh demo run (no resume from old outputs)
+
 cfg = ScrapeConfig(
-    clickstream_dir=str(ROOT / "data/similarweb_clickstream_data"),
-    offline=True,                 # never touches the network in this demo
-    synthetic_n_pages=60,
-    out_dir=str(ROOT / "outputs/scrape"),
+    clickstream_dir=str(DATA),        # a single parquet file is enough
+    offline=True,                     # flip to False (or --online) for real fetching
+    synthetic_n_pages=60,             # corpus size when DATA is absent
+    out_dir=str(OUT),
+    timeout=10.0,                     # socket timeout per request
+    hard_timeout=30.0,                # wall-clock cap per URL (robots + retries + body)
+    max_urls=2000,                    # sample cap when running on the real 265k URLs
+    checkpoint_every=200,
+    progress_every=25,
+    resume=True,
 )
 pd.set_option("display.max_colwidth", 60)
 """)
 
 md("""
-## 2 · Run the pipeline
+## 2 · Run the pipeline — incremental, interruption-safe
 
-One call: resolve sources (real parquet if present, synthetic corpus otherwise)
-→ fetch → extract → classify → extract & match products → write both parquet
-files → self-evaluate against ground truth when the corpus provides it.
+One call: resolve sources (the parquet file if present, synthetic corpus
+otherwise) → stream fetches → extract / classify / match **as each URL
+completes** → append to `scraped_pages.jsonl` / `scraped_products.jsonl` line
+by line → refresh the parquet files at checkpoints and on exit → self-evaluate
+when ground truth exists.
+
+Why it cannot run forever or lose work, by construction:
+
+* every URL has a **hard wall-clock budget** (`hard_timeout`) that covers
+  robots.txt (fetched with a bounded timeout — the stdlib reader would block
+  indefinitely on a dead host), all retries, and slow-dribbling bodies;
+* the per-domain rate limiter **reserves a slot and sleeps outside the lock**,
+  so one slow domain never serializes the other workers;
+* results are processed **as they complete** (`as_completed`), not as a batch:
+  the first page lands in the JSONL within seconds and `[progress]` lines
+  report throughput and ETA;
+* products are written first and the page line last (a **commit marker**), so a
+  crash or Ctrl-C loses at most the single page in flight — and the next run
+  **resumes**, redoing only what's missing.
 """)
 
 code("""
@@ -112,13 +151,18 @@ art = run_scrape(cfg)
 pages, products = art["pages"], art["products"]
 """)
 
+code("""
+# the line-per-record sidecars land next to the parquet files
+sorted(p.name for p in OUT.iterdir())
+""")
+
 # ---------------------------------------------------------------------------- #
 md("""
 ## 3 · `fact_scraped_page` — one row per URL
 
 Identity + fetch metadata + extracted page info + classification + provenance.
-The full 52-column schema is in `docs/SCRAPED_PAGES_SCHEMA.md`; here is the
-analytical core:
+The full schema is in `docs/SCRAPED_PAGES_SCHEMA.md`; here is the analytical
+core:
 """)
 
 code("""
@@ -154,9 +198,11 @@ md("""
 
 `seller_type` answers the requested "external retailer or brand owned" split as
 an **orthogonal axis**, so `shopping` and `catalogue` don't each fork in two.
-`prior_page_type` keeps SimilarWeb's own label verbatim: the classifier blends
-it as a prior (`classifier_method = "rule+prior"`), and the crosstab below makes
-every disagreement auditable.
+When the full star schema is available, `prior_page_type` keeps SimilarWeb's
+own label verbatim and the classifier blends it as a prior
+(`classifier_method = "rule+prior"`); the crosstab makes every disagreement
+auditable. (In input-file-only mode there is no vendor prior — the classifier
+stands alone on URL + markup.)
 """)
 
 code("""
@@ -167,14 +213,50 @@ pd.crosstab(with_prior["prior_page_type"], with_prior["page_subtype"])
 
 # ---------------------------------------------------------------------------- #
 md("""
-## 4 · `fact_scraped_product` — products on the pages, matched to the chat
+## 4 · Attention ranking — dwell time from the browsing trail
+
+`next_10_urls` records up to 10 requests after each turn, each with a
+`request_time` (epoch ms). The gap to the **next** request is how long the user
+stayed before moving on — a retention / relevancy signal. The **last** entry
+has no successor, so its dwell is never guessed (it stays null). Per URL the
+pipeline aggregates:
+
+* `mean_dwell_seconds` / `total_dwell_seconds` — attention per visit / overall;
+* `mean_trail_position` — how early after the answer the page tends to appear
+  (1 = the first thing the user opened).
+
+Read dwell as an **upper bound** on attention: the clock keeps running while
+the user is idle or in another tab. Long dwell + early trail position on a
+`shopping` page is the strongest behavioural signal short of a purchase flag.
+""")
+
+code("""
+trail = pages[pages["mean_dwell_seconds"].notna()]
+rank_cols = ["url", "page_category", "funnel_stage", "times_visited",
+             "mean_dwell_seconds", "total_dwell_seconds", "mean_trail_position"]
+print(f"{len(trail)}/{len(pages)} pages appear in browsing trails")
+trail.sort_values("total_dwell_seconds", ascending=False)[rank_cols].head(10)
+""")
+
+code("""
+by_cat = (trail.groupby("page_category")["mean_dwell_seconds"]
+          .agg(["count", "mean", "median"]).round(1)
+          .sort_values("mean", ascending=False))
+by_cat
+""")
+
+# ---------------------------------------------------------------------------- #
+md("""
+## 5 · `fact_scraped_product` — products on the pages, matched to the chat
 
 Product metadata comes from schema.org `Product` JSON-LD first (what Google
 Shopping reads), then OpenGraph `product:*`, microdata, and a visible-price
 heuristic — `extraction_source` records which. Each product is scored against
 the entities the agent mentioned on the turn(s) that surfaced the page
 (SKU > brand > name-overlap > category), and `coincides` fires when the score
-clears `cfg.coincide_threshold` (0.5).
+clears `cfg.coincide_threshold` (0.5). In input-file-only mode there is no
+entity table, so products carry their metadata with `match_type = "none"` —
+the matching lights up as soon as `fact_ai_recommendation` is added.
 """)
 
 code("""
@@ -191,7 +273,7 @@ products.loc[products["coincides"], match_cols].head(8)
 """)
 
 md("""
-## 5 · Self-evaluation
+## 6 · Self-evaluation
 
 The synthetic corpus ships ground-truth labels (category, seller, expected
 coincidence), so the pipeline scores itself on every run. **Read this as a test
@@ -205,11 +287,13 @@ art["evaluation"]
 
 # ---------------------------------------------------------------------------- #
 md("""
-## 6 · The parquet artefacts
+## 7 · The parquet artefacts
 
 Both tables are written with explicit pyarrow schemas — nullable ints
 (`http_status`, `rating_count`), `list<string>` columns (`schema_types`,
-`message_ids`) and floats-with-null all round-trip cleanly.
+`message_ids`) and floats-with-null (`mean_dwell_seconds`, …) all round-trip
+cleanly. The `.jsonl` sidecars next to them are the crash-safe source of
+truth for resume.
 """)
 
 code("""
@@ -219,18 +303,20 @@ for f in ("scraped_pages.parquet", "scraped_products.parquet"):
     t = pq.read_table(Path(cfg.out_dir) / f)
     print(f"{f}: {t.num_rows} rows x {t.num_columns} cols")
 print()
-print(pq.read_table(Path(cfg.out_dir) / "scraped_pages.parquet").schema.to_string()[:600])
+print(pq.read_table(Path(cfg.out_dir) / "scraped_pages.parquet").schema.to_string()[:700])
 """)
 
 md("""
-## 7 · Running it for real
+## 8 · Running it for real
 
 ```bash
-# real URLs from the clickstream, polite online fetching, vendor prior on
-python -m conveyer.scraping --clickstream-dir data/similarweb_clickstream_data \\
-    --online --max-urls 5000 --dedupe-by url
+# everything from the raw input file alone, polite online fetching
+python -m conveyer.scraping \\
+    --clickstream-dir data/similarweb_clickstream_data/simweb_input_file.parquet \\
+    --online --max-urls 2000 --hard-timeout 30 --progress-every 50
 
-# only links the LLM actually recommended, one representative per domain
+# interrupted? just run the same command again — it resumes from the JSONL
+# only links the LLM actually cited, one representative per domain
 python -m conveyer.scraping --online --only-recommended --dedupe-by domain
 ```
 
@@ -239,20 +325,21 @@ Key `ScrapeConfig` knobs:
 | knob | default | meaning |
 |---|---|---|
 | `offline` | `True` | never touch the network; serve corpus/cache |
-| `respect_robots` / `rate_limit_per_domain` | `True` / 1.0s | politeness (per-domain throttle + robots.txt) |
+| `timeout` / `hard_timeout` | 10s / 30s | socket timeout · **wall-clock cap per URL** (robots + retries + body) |
+| `respect_robots` / `rate_limit_per_domain` | `True` / 1.0s | politeness (per-domain slot reservation, other domains never blocked) |
+| `resume` / `checkpoint_every` / `progress_every` | `True` / 500 / 25 | line-by-line JSONL + parquet snapshots + progress/ETA lines |
 | `use_cache` / `cache_dir` | `True` | every fetch cached; re-runs are free |
 | `max_urls`, `only_recommended`, `dedupe_by` | all / off / url | scope control for the 265k-URL universe |
 | `classifier` | `auto` | rule scorer; refines low-confidence pages with an LLM when `ANTHROPIC_API_KEY` is set |
-| `use_similarweb_prior` / `prior_weight` | `True` / 0.5 | blend `dim_digital_site.page_type` into the vote |
 | `coincide_threshold` | 0.5 | match score needed to declare product coincidence |
 
 **Known limits & next steps.** (1) JS-rendered storefronts need a headless
 browser — plug Playwright in at `Fetcher.fetch` if coverage demands it.
-(2) `matched_recommendation_id` is inferred (the source
-`click_through.recommendation_id` is 100% null) — keep `match_score` in
-downstream models. (3) The scraped `funnel_stage` gives `conveyer.funnel`'s HMM
-a second, behavioural emission channel: *where the user actually landed* vs
-*what they asked*.
+(2) In input-file-only mode product↔chat matching is dormant (no entity
+table); add `fact_ai_recommendation`/`fact_ai_concept` to light it up.
+(3) The scraped `funnel_stage` + dwell give `conveyer.funnel`'s HMM a second,
+behavioural emission channel: *where the user actually went and how long they
+stayed* vs *what they asked*.
 """)
 
 # ============================================================================ #

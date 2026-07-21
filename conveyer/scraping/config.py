@@ -58,7 +58,10 @@ class ScrapeConfig:
     respect_robots: bool = True
     user_agent: str = ("conveyer-research-bot/0.2 (+https://github.com/; "
                        "skincare agentic-commerce study; contact via repo)")
-    timeout: float = 15.0
+    timeout: float = 10.0                # socket connect/read timeout (per request)
+    hard_timeout: float = 30.0           # wall-clock cap per URL: covers robots +
+                                         # all retries + slow-dribble bodies. A URL
+                                         # can never stall the pipeline longer than this.
     max_retries: int = 2
     retry_backoff: float = 2.0           # seconds; doubles each retry
     rate_limit_per_domain: float = 1.0   # min seconds between hits to one domain
@@ -85,10 +88,13 @@ class ScrapeConfig:
     match_name_threshold: float = 0.34   # token-overlap cutoff for a name match
     coincide_threshold: float = 0.5      # match_score >= this ⇒ coincides = True
 
-    # --- Outputs ------------------------------------------------------------ #
+    # --- Outputs (incremental: line-per-record JSONL + parquet snapshots) ---- #
     out_dir: str = "outputs/scrape"
     pages_filename: str = "scraped_pages.parquet"
     products_filename: str = "scraped_products.parquet"
+    resume: bool = True                  # skip URLs already in the JSONL sidecar
+    checkpoint_every: int = 500          # refresh the parquet files every N new pages
+    progress_every: int = 25             # print a progress line every N pages
 
     def pages_path(self) -> str:
         import os
@@ -97,3 +103,9 @@ class ScrapeConfig:
     def products_path(self) -> str:
         import os
         return os.path.join(self.out_dir, self.products_filename)
+
+    def pages_jsonl_path(self) -> str:
+        return self.pages_path().rsplit(".", 1)[0] + ".jsonl"
+
+    def products_jsonl_path(self) -> str:
+        return self.products_path().rsplit(".", 1)[0] + ".jsonl"

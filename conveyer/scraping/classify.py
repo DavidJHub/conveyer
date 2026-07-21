@@ -252,8 +252,11 @@ def _markup_votes(page: PageContent, n_products: int) -> Dict[str, float]:
 
 def _skincare_relevance(page: PageContent, u: UrlParts, chat_brands: set,
                         prior_category: str = "") -> float:
+    # URL slugs are evidence too — critical when the body couldn't be fetched:
+    # /product/cerave-moisturizing-cream is on-topic even with zero HTML.
+    url_text = re.sub(r"[-_+/=&?.]", " ", f"{u.path} {u.query}")
     text = " ".join([page.title, page.meta_description, " ".join(page.h1),
-                     page.text[:3000]])
+                     page.text[:3000], url_text])
     hits = len(_SKINCARE_KEYWORDS.findall(text))
     score = min(1.0, hits / 4.0)
     # Only a skincare brand's own storefront is topical by domain alone; a
@@ -261,9 +264,11 @@ def _skincare_relevance(page: PageContent, u: UrlParts, chat_brands: set,
     # relevance — otherwise off-topic products on it look study-relevant.
     if u.core in BRAND_DOMAINS:
         score = max(score, 0.5)
+    blob = normalize(text)
+    if any(len(b) > 3 and b in blob for b in BRAND_DOMAINS):
+        score = max(score, 0.4)
     if chat_brands:
         bt = {normalize(b) for b in chat_brands}
-        blob = normalize(text)
         if any(b and b in blob for b in bt):
             score = max(score, 0.6)
     if prior_category and prior_category.lower() in (
@@ -329,10 +334,14 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
         elif str(prior.get(cfg.col_seller_type, "")).lower() in ("1p", "3p"):
             seller = "retailer"
 
-    # topical relevance overrides the headline bucket (user's "unrelated" case)
+    # topical relevance overrides the headline bucket (user's "unrelated" case).
+    # "unrelated" is a *confident* judgement — it needs page content (or URL
+    # evidence) to stand on. A page we never fetched stays "unknown", with the
+    # structural subtype preserved.
+    has_content = bool(page.title or page.text or page.og)
     final_category = category
-    if not is_relevant and category not in ("unknown",):
-        final_category = "unrelated"
+    if not is_relevant and category != "unknown":
+        final_category = "unrelated" if has_content else "unknown"
 
     # page-intrinsic brand (the brand this page is *about*) — used for matching.
     # Deliberately NOT the chat brand: letting a brand-less product inherit the

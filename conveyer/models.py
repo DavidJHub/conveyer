@@ -1,21 +1,24 @@
-"""Model layer: embedding backends and the LLM client.
+"""Model layer: embedding backends, optional sentiment model, LLM client.
 
-The embedder is chosen by :func:`build_embedder`. With ``embedding_backend="auto"``
-it resolves the best available option at runtime, preferring API models when
-their keys are present and degrading gracefully to a fully local TF-IDF backend
-so nothing hard-fails in a minimal environment:
+Every backend auto-resolves to the best available option and degrades
+gracefully, so nothing here hard-fails in a minimal environment:
 
-    Voyage (voyage-3-large)  ->  OpenAI (text-embedding-3-large)
-        ->  sentence-transformers (open)  ->  TF-IDF + SVD
+* embeddings: Voyage (VOYAGE_API_KEY) → OpenAI (OPENAI_API_KEY)
+  → sentence-transformers (local) → TF-IDF + SVD (always works);
+* sentiment: HuggingFace ``transformers`` pipeline when installed
+  → the lexicon scorer in :mod:`conveyer.conversations` otherwise;
+* LLM: Anthropic Messages API when ``anthropic`` + ``ANTHROPIC_API_KEY``
+  are present, else ``None``.
 """
+
+from __future__ import annotations
 
 import importlib
 import os
-from typing import List, Sequence
+from dataclasses import dataclass
+from typing import List, Optional, Sequence
 
 import numpy as np
-
-from .config import PipelineConfig
 
 
 def _have(mod: str) -> bool:
@@ -24,6 +27,25 @@ def _have(mod: str) -> bool:
         return True
     except ImportError:
         return False
+
+
+@dataclass
+class ModelConfig:
+    """Knobs for the model layer (embedded by each module's own config)."""
+    embedding_backend: str = "auto"   # auto | voyage | openai | sentence_transformers | tfidf
+    voyage_model: str = "voyage-3-large"
+    openai_model: str = "text-embedding-3-large"
+    st_model: str = "BAAI/bge-large-en-v1.5"
+    normalize_embeddings: bool = True
+    embed_batch_size: int = 128
+    tfidf_components: int = 256
+    random_state: int = 42
+    # sentiment
+    sentiment_backend: str = "auto"   # auto | transformers | lexicon
+    sentiment_model: str = "distilbert-base-uncased-finetuned-sst-2-english"
+    # LLM
+    llm_model: str = "claude-opus-4-8"  # override via ANTHROPIC_MODEL env var
+    llm_max_tokens: int = 400
 
 
 # --------------------------------------------------------------------------- #
@@ -39,7 +61,7 @@ class BaseEmbedder:
 class VoyageEmbedder(BaseEmbedder):
     """Voyage AI embeddings (Anthropic-recommended). Needs VOYAGE_API_KEY."""
 
-    def __init__(self, cfg: PipelineConfig):
+    def __init__(self, cfg: ModelConfig):
         import voyageai
 
         self.cfg = cfg
@@ -51,17 +73,16 @@ class VoyageEmbedder(BaseEmbedder):
         out: List[List[float]] = []
         bs = self.cfg.embed_batch_size
         for i in range(0, len(texts), bs):
-            batch = texts[i:i + bs]
-            resp = self.client.embed(batch, model=self.cfg.voyage_model, input_type="document")
+            resp = self.client.embed(texts[i:i + bs], model=self.cfg.voyage_model,
+                                     input_type="document")
             out.extend(resp.embeddings)
-        emb = np.asarray(out, dtype=np.float32)
-        return _maybe_normalize(emb, self.cfg)
+        return _maybe_normalize(np.asarray(out, dtype=np.float32), self.cfg)
 
 
 class OpenAIEmbedder(BaseEmbedder):
     """OpenAI embeddings. Needs OPENAI_API_KEY."""
 
-    def __init__(self, cfg: PipelineConfig):
+    def __init__(self, cfg: ModelConfig):
         from openai import OpenAI
 
         self.cfg = cfg
@@ -73,17 +94,16 @@ class OpenAIEmbedder(BaseEmbedder):
         out: List[List[float]] = []
         bs = self.cfg.embed_batch_size
         for i in range(0, len(texts), bs):
-            batch = texts[i:i + bs]
-            resp = self.client.embeddings.create(model=self.cfg.openai_model, input=batch)
+            resp = self.client.embeddings.create(model=self.cfg.openai_model,
+                                                 input=texts[i:i + bs])
             out.extend([d.embedding for d in resp.data])
-        emb = np.asarray(out, dtype=np.float32)
-        return _maybe_normalize(emb, self.cfg)
+        return _maybe_normalize(np.asarray(out, dtype=np.float32), self.cfg)
 
 
 class SentenceTransformerEmbedder(BaseEmbedder):
     """Local open-source embeddings via sentence-transformers."""
 
-    def __init__(self, cfg: PipelineConfig):
+    def __init__(self, cfg: ModelConfig):
         from sentence_transformers import SentenceTransformer
 
         self.cfg = cfg
@@ -91,21 +111,17 @@ class SentenceTransformerEmbedder(BaseEmbedder):
         self.name = f"sentence-transformers:{cfg.st_model}"
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
-        emb = self.model.encode(
-            list(texts),
-            batch_size=self.cfg.embed_batch_size,
-            show_progress_bar=True,
-            normalize_embeddings=self.cfg.normalize_embeddings,
-        )
+        emb = self.model.encode(list(texts), batch_size=self.cfg.embed_batch_size,
+                                show_progress_bar=False,
+                                normalize_embeddings=self.cfg.normalize_embeddings)
         return np.asarray(emb, dtype=np.float32)
 
 
 class TfidfEmbedder(BaseEmbedder):
     """Fully local fallback: TF-IDF + TruncatedSVD (LSA)."""
 
-    def __init__(self, cfg: PipelineConfig, n_components: int = 256):
+    def __init__(self, cfg: ModelConfig):
         self.cfg = cfg
-        self.n_components = n_components
         self.name = "tfidf+svd"
 
     def encode(self, texts: Sequence[str]) -> np.ndarray:
@@ -114,18 +130,17 @@ class TfidfEmbedder(BaseEmbedder):
         from sklearn.preprocessing import normalize
 
         texts = list(texts)
-        tfidf = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=5000, stop_words="english")
+        tfidf = TfidfVectorizer(ngram_range=(1, 2), min_df=1, max_features=5000,
+                                stop_words="english")
         X = tfidf.fit_transform(texts)
-        k = min(self.n_components, X.shape[1] - 1, max(2, X.shape[0] - 1))
-        svd = TruncatedSVD(n_components=k, random_state=self.cfg.random_state)
-        emb = svd.fit_transform(X).astype(np.float32)
+        k = min(self.cfg.tfidf_components, X.shape[1] - 1, max(2, X.shape[0] - 1))
+        emb = TruncatedSVD(n_components=k, random_state=self.cfg.random_state) \
+            .fit_transform(X).astype(np.float32)
         self.name = f"tfidf+svd({k})"
-        if self.cfg.normalize_embeddings:
-            emb = normalize(emb)
-        return emb
+        return normalize(emb) if self.cfg.normalize_embeddings else emb
 
 
-def _maybe_normalize(emb: np.ndarray, cfg: PipelineConfig) -> np.ndarray:
+def _maybe_normalize(emb: np.ndarray, cfg: ModelConfig) -> np.ndarray:
     if cfg.normalize_embeddings:
         from sklearn.preprocessing import normalize
 
@@ -133,7 +148,7 @@ def _maybe_normalize(emb: np.ndarray, cfg: PipelineConfig) -> np.ndarray:
     return emb
 
 
-def _resolve_backend(cfg: PipelineConfig) -> str:
+def _resolve_backend(cfg: ModelConfig) -> str:
     if cfg.embedding_backend != "auto":
         return cfg.embedding_backend
     if os.environ.get("VOYAGE_API_KEY") and _have("voyageai"):
@@ -145,20 +160,18 @@ def _resolve_backend(cfg: PipelineConfig) -> str:
     return "tfidf"
 
 
-def build_embedder(cfg: PipelineConfig) -> BaseEmbedder:
+def build_embedder(cfg: Optional[ModelConfig] = None) -> BaseEmbedder:
     """Instantiate the configured (or best available) embedding backend."""
+    cfg = cfg or ModelConfig()
     backend = _resolve_backend(cfg)
-    builders = {
-        "voyage": VoyageEmbedder,
-        "openai": OpenAIEmbedder,
-        "sentence_transformers": SentenceTransformerEmbedder,
-        "tfidf": TfidfEmbedder,
-    }
+    builders = {"voyage": VoyageEmbedder, "openai": OpenAIEmbedder,
+                "sentence_transformers": SentenceTransformerEmbedder,
+                "tfidf": TfidfEmbedder}
     if backend not in builders:
         raise ValueError(f"Unknown embedding_backend: {backend}")
     try:
         return builders[backend](cfg)
-    except Exception as exc:  # missing dep / missing key at construction time
+    except Exception as exc:  # missing dep / key at construction time
         if backend == "tfidf":
             raise
         print(f"[models] backend '{backend}' unavailable ({exc}); falling back to TF-IDF.")
@@ -166,12 +179,33 @@ def build_embedder(cfg: PipelineConfig) -> BaseEmbedder:
 
 
 # --------------------------------------------------------------------------- #
-# LLM client (cluster naming / zero-shot intent)
+# Optional transformer sentiment
+# --------------------------------------------------------------------------- #
+def build_sentiment_pipeline(cfg: Optional[ModelConfig] = None):
+    """A HuggingFace sentiment pipeline, or None (caller falls back to lexicon)."""
+    cfg = cfg or ModelConfig()
+    if cfg.sentiment_backend == "lexicon":
+        return None
+    if not _have("transformers"):
+        if cfg.sentiment_backend == "transformers":
+            print("[models] transformers requested but not installed; using lexicon.")
+        return None
+    try:
+        from transformers import pipeline
+
+        return pipeline("sentiment-analysis", model=cfg.sentiment_model, truncation=True)
+    except Exception as exc:
+        print(f"[models] sentiment pipeline unavailable ({exc}); using lexicon.")
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# LLM client
 # --------------------------------------------------------------------------- #
 class AnthropicLLM:
     """Thin wrapper over the Anthropic Messages API."""
 
-    def __init__(self, cfg: PipelineConfig):
+    def __init__(self, cfg: ModelConfig):
         import anthropic
 
         self.cfg = cfg
@@ -184,16 +218,12 @@ class AnthropicLLM:
         if system:
             kwargs["system"] = system
         msg = self.client.messages.create(**kwargs)
-        return "".join(block.text for block in msg.content if getattr(block, "type", None) == "text")
+        return "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
 
 
-def build_llm(cfg: PipelineConfig) -> "AnthropicLLM | None":
-    """Return an LLM client if any LLM-backed feature is enabled and usable."""
-    wants_llm = cfg.use_llm_naming or cfg.llm_keyphrase_expansion or cfg.llm_select_granularity
-    if not wants_llm:
-        return None
+def build_llm(cfg: Optional[ModelConfig] = None) -> "AnthropicLLM | None":
+    cfg = cfg or ModelConfig()
     if not _have("anthropic") or not os.environ.get("ANTHROPIC_API_KEY"):
-        print("[models] an LLM feature was requested but anthropic/ANTHROPIC_API_KEY is missing; skipping.")
         return None
     return AnthropicLLM(cfg)
 
@@ -201,4 +231,5 @@ def build_llm(cfg: PipelineConfig) -> "AnthropicLLM | None":
 def detect_capabilities() -> dict:
     """Report which optional dependencies are importable."""
     return {m: _have(m) for m in
-            ("voyageai", "openai", "sentence_transformers", "bertopic", "umap", "hdbscan", "anthropic")}
+            ("voyageai", "openai", "sentence_transformers", "bertopic",
+             "transformers", "bs4", "anthropic")}

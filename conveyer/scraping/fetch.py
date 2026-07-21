@@ -57,6 +57,17 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def base_url_of(url: str) -> str:
+    """``scheme://host/`` for a URL — the fallback target when the deep link is
+    unreachable (x.com/…/status/…/photo/1 → x.com/). Empty when unparseable or
+    already a root."""
+    u = parse_url(url)
+    if not u.host:
+        return ""
+    base = f"{u.scheme or 'https'}://{u.host}/"
+    return "" if base.rstrip("/") == str(url).rstrip("/") else base
+
+
 def _cache_path(cfg: ScrapeConfig, url: str) -> str:
     h = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
     return os.path.join(cfg.cache_dir, f"{h}.json")

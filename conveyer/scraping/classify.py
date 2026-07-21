@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from urllib.parse import urlsplit
 
+from ..brands import BRAND_DOMAIN_CORES
 from ..ingest import normalize
 from .config import ScrapeConfig
 from .extract import PageContent
@@ -95,17 +96,10 @@ REFERENCE_DOMAINS = {
     "aad", "nih", "ncbi", "nlm", "cdc", "everydayhealth", "verywellhealth",
     "clevelandclinic", "hopkinsmedicine", "medlineplus", "fda", "paulaschoice-eu",
 }
-# Known brand-owned skincare storefronts (not exhaustive — the domain-vs-brand
-# heuristic covers the long tail).
-BRAND_DOMAINS = {
-    "cerave", "theordinary", "deciem", "laroche-posay", "larocheposay",
-    "olay", "neutrogena", "cetaphil", "paulaschoice", "drunkelephant",
-    "tatcha", "kiehls", "clinique", "esteelauder", "glossier", "theinkeylist",
-    "skinceuticals", "murad", "eltamd", "isdin", "bioderma", "avene", "vichy",
-    "goodmolecules", "firstaidbeauty", "youthtothepeople", "summerfridays",
-    "cocokind", "versedskin", "krave", "beautyofjoseon", "cosrx", "innisfree",
-    "laneige", "farmacybeauty", "supergoop", "biossance", "eltamdskincare",
-}
+# Known brand-owned skincare storefronts, derived from the canonical brand
+# lexicon (conveyer.brands) so text mentions and domain matches resolve to the
+# same brands. The domain-vs-brand heuristic covers the long tail.
+BRAND_DOMAINS = set(BRAND_DOMAIN_CORES)
 
 # Multi-label TLDs so registrable-domain extraction handles co.uk etc.
 _MULTI_TLD = {

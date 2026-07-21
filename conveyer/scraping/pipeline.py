@@ -40,7 +40,7 @@ import pandas as pd
 from .classify import PageClass, classify_page
 from .config import ScrapeConfig
 from .extract import PageContent, extract_page
-from .fetch import Fetcher, FetchResult, _cache_path
+from .fetch import Fetcher, FetchResult, _cache_path, base_url_of
 from .products import extract_products, match_products
 from .schema import (PAGE_SCHEMA, PRODUCT_SCHEMA, build_frames, page_row,
                      product_rows, write_parquet)
@@ -123,24 +123,46 @@ def _prior_for(cfg: ScrapeConfig, row: dict) -> dict:
 
 
 def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
-                 fr: FetchResult) -> Tuple[dict, List[dict]]:
+                 fr: FetchResult, fetcher: Fetcher) -> Tuple[dict, List[dict]]:
     """fetch result → (page_row, product_rows). Never raises: any extraction or
     classification error degrades to an 'unknown' page row so one bad page
-    cannot kill a long run."""
+    cannot kill a long run.
+
+    Fallback chain (the classifier's multimodal design does the rest):
+    1. the page itself (``fetch_scope="page"``);
+    2. the **base URL** (``scheme://host/``) when the deep link is unreachable —
+       x.com/…/status/… → x.com/ — so domain-level content still informs
+       relevance/category (``fetch_scope="base"``; cache makes this ~free since
+       base pages repeat across thousands of deep links);
+    3. URL + domain heuristics alone (``fetch_scope="none"``).
+    """
     url = row_d.get("url") or fr.url
     try:
+        scope = "page" if fr.ok else "none"
         content = extract_page(fr.html, url=url, parser=cfg.html_parser) if fr.ok \
             else PageContent(url=url)
-        products = extract_products(content, cfg.max_products_per_page) if fr.ok else []
+        if not fr.ok and cfg.base_fallback:
+            base = base_url_of(url)
+            if base:
+                frb = fetcher.fetch(base)
+                if frb.ok:
+                    content = extract_page(frb.html, url=url, parser=cfg.html_parser)
+                    scope = "base"
+        # products only from the page itself — a homepage's markup must not be
+        # attributed to a deep link it stands in for
+        products = extract_products(content, cfg.max_products_per_page) \
+            if scope == "page" else []
         chat_brands = chat_brands_for(row_d, src.mentions)
         mentions = mentions_for(row_d, src.mentions)
         cls = classify_page(content, url, cfg, prior=_prior_for(cfg, row_d),
                             n_products=len(products), chat_brands=chat_brands)
+        if scope == "base":
+            cls.signals = [s for s in cls.signals if s != "content"] + ["base_content"]
         mid = (row_d.get("message_ids") or [""])[0]
         match_products(products, cls.primary_brand, mentions, message_id=str(mid),
                        coincide_threshold=cfg.coincide_threshold,
                        name_threshold=cfg.match_name_threshold)
-        pr = page_row(row_d, fr, content, cls, len(products))
+        pr = page_row(row_d, fr, content, cls, len(products), fetch_scope=scope)
         return pr, product_rows(pr["page_id"], url, products)
     except Exception as exc:
         err = FetchResult(url=url, status=fr.status, http_status=fr.http_status,
@@ -148,7 +170,8 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
                           error=(fr.error + f" | process: {type(exc).__name__}: {exc}").strip(" |"),
                           fetched_at=fr.fetched_at)
         pr = page_row(row_d, err, PageContent(url=url),
-                      PageClass(page_category="unknown", method="error"), 0)
+                      PageClass(page_category="unknown", method="error"), 0,
+                      fetch_scope="none")
         return pr, []
 
 
@@ -193,7 +216,7 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
     try:
         for fr in fetcher.iter_fetch(pending):
             row_d = row_by_url.get(fr.url, {"url": fr.url})
-            pr, prods = _process_one(cfg, src, row_d, fr)
+            pr, prods = _process_one(cfg, src, row_d, fr, fetcher)
 
             # products first, page line last: the page line is the commit marker
             for p in prods:

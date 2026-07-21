@@ -318,6 +318,20 @@ def make_corpus(n_pages: int = 60, seed: int = 42) -> ScrapeSources:
         add(cart_url, None, "shopping", "retailer", "cart", mid,
             recommended=False, coincides_expected=False)
 
+        # an unfetchable deep link on an UNKNOWN indie-brand domain whose BASE
+        # page is reachable: the base-URL fallback must supply the topical
+        # evidence (fetch_scope="base") that turns unknown into shopping
+        indie = f"glowessence-{turn % 3}.com"
+        base_url = f"https://www.{indie}/"
+        base_body = (f"<h1>GlowEssence Skincare</h1><p>Clean skincare: serums, "
+                     f"moisturizers and sunscreen for sensitive skin. Shop our "
+                     f"hydrating collection.</p>")
+        html_by_url[base_url] = _doc("en", "GlowEssence — Clean Skincare",
+                                     "Indie skincare brand.", "website", base_url,
+                                     "", base_body, site_name="GlowEssence")
+        add(f"https://www.{indie}/products/hydra-serum-{turn}", None,
+            "shopping", "na", "pdp", mid, recommended=False, coincides_expected=False)
+
         turn += 1
 
     keep = list(rows.keys())[:n_pages]

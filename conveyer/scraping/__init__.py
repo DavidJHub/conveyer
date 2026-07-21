@@ -30,10 +30,22 @@ from .config import ScrapeConfig
 from .pipeline import evaluate, run_scrape
 from .taxonomy import CATEGORY_DEFINITIONS, PAGE_CATEGORIES, SELLER_TYPES
 
+
+def classify_url(url: str, cfg: "ScrapeConfig | None" = None):
+    """URL-only classification (no fetch): the multimodal rule scorer over URL
+    tokens + domain knowledge. Used by :mod:`conveyer.journey` to cover trail
+    URLs that weren't scraped, and handy interactively."""
+    from .classify import classify_rule
+    from .extract import PageContent
+
+    return classify_rule(PageContent(url=url), url, cfg or ScrapeConfig())
+
+
 __all__ = [
     "ScrapeConfig",
     "run_scrape",
     "evaluate",
+    "classify_url",
     "PAGE_CATEGORIES",
     "SELLER_TYPES",
     "CATEGORY_DEFINITIONS",

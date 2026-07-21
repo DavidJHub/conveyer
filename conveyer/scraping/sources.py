@@ -29,20 +29,22 @@ never guessed.
 
 from __future__ import annotations
 
-import ast
 import glob
-import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 
-from ..ingest import normalize
+from ..ingest import as_records, event_url, normalize, trail_events
 from .classify import parse_url
 from .config import ScrapeConfig
 from .products import RecMention
+
+# canonical list-cell / trail parsing lives in conveyer.ingest; these aliases
+# keep the public names this module has always exposed
+_as_records = as_records
+_event_url = event_url
 
 # concept_name values that identify a product entity (see data dictionary §2.2)
 _BRAND_CONCEPTS = {"BRAND"}
@@ -102,78 +104,6 @@ def load_clickstream(cfg: ScrapeConfig) -> Optional[Dict[str, pd.DataFrame]]:
                     continue
                 break
     return out or None
-
-
-# --------------------------------------------------------------------------- #
-# List-cell coercion + browsing-trail parsing
-# --------------------------------------------------------------------------- #
-def _as_records(cell: Any) -> List[Any]:
-    """Coerce a link-list cell into a plain Python list.
-
-    Real parquet gives ``next_10_urls`` back as a **numpy array of dicts**
-    (``ingest.to_list`` would silently return [] for those); other exports give
-    Python lists, or a stringified repr with single quotes. Handle all of them.
-    """
-    if cell is None:
-        return []
-    if isinstance(cell, np.ndarray):
-        return cell.tolist()
-    if isinstance(cell, (list, tuple)):
-        return list(cell)
-    if isinstance(cell, float) and pd.isna(cell):
-        return []
-    if isinstance(cell, str):
-        s = cell.strip()
-        if not s or s.lower() == "none":
-            return []
-        for parser in (json.loads, ast.literal_eval):
-            try:
-                v = parser(s)
-                if isinstance(v, (list, tuple)):
-                    return list(v)
-                return [v]
-            except (ValueError, SyntaxError):
-                continue
-        return [s]
-    return [cell]
-
-
-def _event_url(item: Any) -> str:
-    if isinstance(item, dict):
-        return str(item.get("requested_site") or item.get("url") or "").strip()
-    return str(item or "").strip()
-
-
-def _event_time_ms(item: Any) -> Optional[int]:
-    if not isinstance(item, dict):
-        return None
-    t = item.get("request_time")
-    try:
-        return int(str(t))
-    except (TypeError, ValueError):
-        return None
-
-
-def trail_events(cell: Any) -> List[Dict[str, Any]]:
-    """Parse one ``next_10_urls`` cell into ordered events with dwell times.
-
-    ``dwell_seconds`` for event *i* is the gap until request *i+1* — how long
-    the user stayed before moving on. The **last** event has no successor, so
-    its dwell is None (never guessed). Position is 1-based within the trail.
-    """
-    items = _as_records(cell)
-    events = [{"url": _event_url(it), "t_ms": _event_time_ms(it)} for it in items]
-    events = [e for e in events if e["url"]]
-    if all(e["t_ms"] is not None for e in events) and len(events) > 1:
-        events.sort(key=lambda e: e["t_ms"])
-    out: List[Dict[str, Any]] = []
-    for i, e in enumerate(events):
-        dwell = None
-        if i + 1 < len(events) and e["t_ms"] is not None and events[i + 1]["t_ms"] is not None:
-            delta = (events[i + 1]["t_ms"] - e["t_ms"]) / 1000.0
-            dwell = delta if delta >= 0 else None
-        out.append({"url": e["url"], "position": i + 1, "dwell_seconds": dwell})
-    return out
 
 
 # --------------------------------------------------------------------------- #

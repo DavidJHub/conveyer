@@ -1,38 +1,43 @@
-"""conveyer — analysis of skincare LLM conversations for agentic e-commerce.
+"""conveyer — from ChatGPT shopping conversations to a predictive funnel model.
 
-Public API:
-    PipelineConfig   configuration (column mapping, models, hyper-parameters)
-    run_pipeline     end-to-end clustering/analysis orchestration
-    ingest, models, clustering, analysis, viz   the pipeline stages
-    aces         ACES simulator integration (prompt perturbations, experiment
-                 grids, offline logit agent)
-    augment      DB augmentation with perturbed prompts
-    funnel       purchase-journey stage inference (text classifier + HMM)
-    graphs       user x session x entity interaction network
-    attribution  Bayesian conversion, MRP extrapolation, MMM, MNL utility
-                 model, Shapley explanations
-    scraping     scrape surfaced pages, classify them (catalogue/landing/shopping/
-                 …), extract product metadata and match it to the chat recommendation
+Input: one parquet of conversations (session_id, message_id, user_id,
+prompt_datetime, question, answer, a_links_source, ai_click, next_10_urls).
+
+Three modules, each writing parquet outputs with pinned schemas:
+
+    conversations  MODULE 1 — turn + session features: intent, sentiment,
+                   topics, brand mentions (the agent-recommendation exposure),
+                   funnel stages (keyword classifier + HMM smoothing)
+    scraping       MODULE 2 — fetch + classify every surfaced/visited URL
+                   (multimodal: page content → base-URL fallback → URL/domain
+                   heuristics), extract products, match them to the chat
+    journey        MODULE 3 — connect both: behavioural events, conversion
+                   rate (documented cart/checkout proxy) with credible
+                   intervals, funnel transitions, and the logistic model whose
+                   standardized coefficients weigh agent recommendations
+                   against every other driver
+
+Support: ingest (loading + trail parsing + synthetic ground truth), brands
+(the canonical lexicon both text and domains resolve to), funnel (stage
+taxonomy + HMM), models (auto-resolved embedding/sentiment/LLM backends).
+
+    from conveyer import run_pipeline
+    art = run_pipeline()                       # synthetic + offline by default
 """
-from . import (aces, analysis, attribution, augment, clustering, funnel,
-               graphs, ingest, models, scraping, viz)
-from .config import PipelineConfig
+from . import (brands, conversations, funnel, ingest, journey, models,
+               scraping)
+from .conversations import ConversationConfig, run_conversations
+from .journey import JourneyConfig, run_journey
 from .pipeline import run_pipeline
+from .scraping import ScrapeConfig, run_scrape
 
 __all__ = [
-    "PipelineConfig",
     "run_pipeline",
-    "ingest",
-    "models",
-    "clustering",
-    "analysis",
-    "viz",
-    "aces",
-    "augment",
-    "funnel",
-    "graphs",
-    "attribution",
-    "scraping",
+    "ConversationConfig", "run_conversations",
+    "ScrapeConfig", "run_scrape",
+    "JourneyConfig", "run_journey",
+    "ingest", "brands", "funnel", "models",
+    "conversations", "scraping", "journey",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -40,8 +40,9 @@ conveyer/
                      editorial/search/community/reference/unrelated/unknown),
                      extract product metadata, match products to the chat.
                      Classification is multimodal with a fallback chain:
-                     page content → base-URL content → URL/domain heuristics —
-                     an unfetchable amazon cart still classifies correctly.
+                     page content → base-URL content → domain-directory
+                     description → URL/domain heuristics — an unfetchable
+                     (robots-blocked) amazon cart still classifies correctly.
                      Incremental (JSONL + resume), polite, hang-proof.
                      → outputs/scrape/scraped_{pages,products}.parquet
 

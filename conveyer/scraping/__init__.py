@@ -33,12 +33,16 @@ from .taxonomy import CATEGORY_DEFINITIONS, PAGE_CATEGORIES, SELLER_TYPES
 
 def classify_url(url: str, cfg: "ScrapeConfig | None" = None):
     """URL-only classification (no fetch): the multimodal rule scorer over URL
-    tokens + domain knowledge. Used by :mod:`conveyer.journey` to cover trail
-    URLs that weren't scraped, and handy interactively."""
+    tokens + domain knowledge + the domain directory's role. Used by
+    :mod:`conveyer.journey` to cover trail URLs that weren't scraped, and handy
+    interactively."""
     from .classify import classify_rule
+    from .directory import lookup
     from .extract import PageContent
 
-    return classify_rule(PageContent(url=url), url, cfg or ScrapeConfig())
+    cfg = cfg or ScrapeConfig()
+    entry = lookup(url, cfg.directory_path) if cfg.directory_fallback else None
+    return classify_rule(PageContent(url=url), url, cfg, directory_entry=entry)
 
 
 __all__ = [

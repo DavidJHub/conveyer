@@ -65,7 +65,7 @@ class ScrapeConfig:
     max_retries: int = 2
     retry_backoff: float = 2.0           # seconds; doubles each retry
     rate_limit_per_domain: float = 1.0   # min seconds between hits to one domain
-    max_workers: int = 8                 # concurrent fetches
+    max_workers: int = 12                # concurrent fetches
     max_bytes: int = 2_000_000           # skip/truncate bodies larger than this
     cache_dir: str = "outputs/scrape_cache"
     use_cache: bool = True
@@ -73,6 +73,15 @@ class ScrapeConfig:
     base_fallback: bool = True           # when a deep link is unreachable, fetch
                                          # scheme://host/ and classify from the
                                          # base page + the original URL's tokens
+    directory_fallback: bool = True      # when nothing is fetchable at all
+                                         # (robots_blocked, bot wall, dead host),
+                                         # classify from the offline domain
+                                         # directory's description of the site
+                                         # (fetch_scope="directory")
+    directory_path: str = "data/domain_directory.json"
+                                         # optional external directory entries,
+                                         # merged over the built-in seed (see
+                                         # conveyer/scraping/directory.py)
 
     # --- Parsing / extraction ----------------------------------------------- #
     html_parser: str = "auto"            # auto | stdlib | bs4 (auto prefers bs4 if installed)

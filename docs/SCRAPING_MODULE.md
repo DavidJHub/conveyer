@@ -81,12 +81,12 @@ filter the list here.
 
 **What it uses.** The **`requests`** library (the standard Python HTTP
 client) for downloads; **`concurrent.futures.ThreadPoolExecutor`** (standard
-library) to run 8 downloads in parallel; **`urllib.robotparser`** (standard
+library) to run 12 downloads in parallel; **`urllib.robotparser`** (standard
 library) to *parse* robots.txt — but the file itself is fetched with a bounded
 timeout, because the stdlib reader can hang forever on a dead host. The cache
 is one JSON file per URL, named by a SHA-256 hash of the URL.
 
-**In plain terms.** Eight polite couriers knock on doors in parallel. Each
+**In plain terms.** Twelve polite couriers knock on doors in parallel. Each
 courier checks the "no soliciting" sign (robots.txt), waits their turn at
 each house (rate limit), gives up after 30 seconds no matter what
 (hard timeout), and photocopies everything they receive (cache) so nobody
@@ -178,6 +178,7 @@ with hand-set weights; votes are summed; the highest-scoring subtype wins.
 | **Domain knowledge** | registrable domain vs curated lists | `amazon.*` → retailer, `reddit.*` → community, `cerave.com` → brand site | Python sets in `classify.py` + the shared brand lexicon `conveyer/brands.py` |
 | **Page markup** | schema.org types, og:type, price/add-to-cart, product count | `@type: Product` → pdp; ≥3 products → collection | reads `PageContent` |
 | **Vendor prior** | SimilarWeb's own `page_type` label | `page_type=checkout` → +1.5 to checkout | weight `3.0 × prior_weight (0.5)` |
+| **Domain directory** | the directory entry's role, for domains the curated lists don't know | external-file entry `role: retailer` → same votes a curated retailer gets | `directory.py`; only speaks when the domain lists are silent |
 
 Confidence is a **softmax** over the summed category scores — roughly "how
 much did the winner beat the runners-up".
@@ -198,12 +199,24 @@ how *skincare-related* the page is. The two axes then combine with care:
 **The fallback chain (why blocked pages still classify).** Orchestrated in
 `pipeline.py::_process_one`, recorded in `fetch_scope`:
 
-1. `page` — the page itself was fetched: all four voters play.
+1. `page` — the page itself was fetched: all voters play.
 2. `base` — the deep link failed (bot wall, 404) → fetch the site's homepage
    (`scheme://host/`) so domain-level content still informs the label.
    Products are **not** extracted from the stand-in homepage.
-3. `none` — nothing fetchable: URL tokens + domain lists + vendor prior alone.
-   An unreachable Amazon cart is still, correctly, a cart.
+3. `directory` — nothing fetchable at all (**`robots_blocked`**, bot wall on
+   the homepage too, dead host) → the **domain directory**
+   (`directory.py`) supplies a stored *description of the site* that stands
+   in as content: "Sephora — specialty beauty retailer selling skincare,
+   makeup…". The directory ships a built-in seed (every curated domain, with
+   hand-written entries for the top sites) and merges an optional external
+   JSON file (`ScrapeConfig.directory_path`, default
+   `data/domain_directory.json`) where you can add long-tail domains without
+   touching code. Stand-in descriptions supply *relevance*, but can never
+   prove a page `unrelated`, never yield products, and never mint a category
+   the URL didn't structurally earn (`sephora.com/careers` stays `unknown`).
+4. `none` — no directory entry either: URL tokens + domain lists + vendor
+   prior alone. An unreachable cart on an unheard-of domain is still,
+   correctly, a cart.
 
 **Optional LLM refinement.** With `classifier="llm"`, or `"auto"` when rule
 confidence < 0.55, and the **`anthropic`** package + `ANTHROPIC_API_KEY`
@@ -322,7 +335,7 @@ six columns almost always explain it:
 | Column | Question it answers |
 |---|---|
 | `fetch_status` / `fetch_error` / `http_status` | Did we even get the page? (`error` + HTTP 403 = bot wall) |
-| `fetch_scope` | Did the label come from the page (`page`), the homepage stand-in (`base`), or the URL alone (`none`)? |
+| `fetch_scope` | Did the label come from the page (`page`), the homepage stand-in (`base`), the domain directory's description (`directory`), or the URL alone (`none`)? |
 | `classification_signals` | Which voters fired: `url` / `domain` / `markup` / `prior` / `content` / `base_content` / `llm` |
 | `classifier_method` | `rule`, `rule+prior`, or `llm` |
 | `page_category_confidence` | How decisive the vote was (softmax) |
@@ -334,8 +347,11 @@ Typical symptoms:
   tokens. Check `fetch_status` first; consider the LLM pass for the residue.
 * **Fetched OK but empty (`word_count` ≈ 0, no products)** → JavaScript-only
   site; the classifier fell back to URL/domain evidence. See improvement 1.
-* **`robots_blocked` on a domain you need** → the site forbids bots; decide
-  policy explicitly, don't just flip `respect_robots`.
+* **`robots_blocked` on a domain you need** → the site forbids bots, so the
+  page is never fetched — but classification still lands via the domain
+  directory (`fetch_scope="directory"`). If the domain is missing from the
+  directory, add it to `data/domain_directory.json` rather than flipping
+  `respect_robots`.
 * **Everything `offline_miss`** → you're in offline mode without a corpus or
   cache; add `--online` or point at cached data.
 * **A page classified from its homepage** (`fetch_scope="base"`) → correct
@@ -386,9 +402,9 @@ Ranked: the first five give you 80% of the mental model.
    Chromium) or a rendering API. Keep it a fallback tier — rendering is
    10–100× slower than plain HTTP.
 2. **Big retailers block bots.** Amazon/Sephora/Ulta often answer 403 or a
-   CAPTCHA page. The base-URL fallback + URL heuristics absorb the
-   *classification* damage, but product extraction is lost exactly where
-   purchases happen.
+   CAPTCHA page. The base-URL + domain-directory fallbacks absorb the
+   *classification* damage (blocked pages still get category, seller and
+   relevance), but product extraction is lost exactly where purchases happen.
    *Improvement:* accept it for the study (URL evidence suffices for funnel
    stage), or use official affiliate/product APIs for the top few domains, or
    a commercial scraping API (see §6) for that shortlist only.
@@ -407,9 +423,10 @@ Ranked: the first five give you 80% of the mental model.
    and gain calibrated confidence.
 5. **Curated domain lists are static and US/skincare-centric.** New
    retailers, non-US domains, and new communities silently miss.
-   *Improvement:* swap `_MULTI_TLD` for **`tldextract`** (uses the real
-   Public Suffix List), and log "high-traffic domain not in any list" during
-   runs so the lists grow from data.
+   *Improvement:* the external directory file (`data/domain_directory.json`)
+   now covers the long tail without code changes — feed it from run logs
+   ("high-traffic domain with no entry"). Also swap `_MULTI_TLD` for
+   **`tldextract`** (uses the real Public Suffix List).
 6. **Token-overlap matching is brittle.** "Vitamin C serum" vs "Ascorbic
    Acid 15%": zero overlap, same product.
    *Improvement (cheap):* **rapidfuzz** string similarity as an extra
@@ -438,7 +455,7 @@ what you could swap in, and when it's worth it.
 
 | Option | What it is | Worth switching when… |
 |---|---|---|
-| `requests` + threads (**current**) | simple, synchronous HTTP, 8 workers | fine up to ~10⁵ URLs; you are here |
+| `requests` + threads (**current**) | simple, synchronous HTTP, 12 workers | fine up to ~10⁵ URLs; you are here |
 | `httpx` / `aiohttp` (async) | same job, one event loop instead of threads | you want 50–200 concurrent fetches cheaply |
 | **Scrapy** | a full crawling *framework*: scheduler, auto-throttle, middlewares, retry policies | scraping becomes a permanent, growing operation |
 | **Playwright / Selenium** | drives a real browser, executes JavaScript | the JS-empty-page problem (improvement 1) |
@@ -467,6 +484,54 @@ what you could swap in, and when it's worth it.
 The pragmatic architecture — and the one this module already sketches — is a
 **cascade**: cheap rules label the easy 80–90%, and only the low-confidence
 remainder escalates to embeddings or an LLM.
+
+#### Blueprint: a fine-tuned DistilBERT page classifier
+
+DistilBERT is a small transformer (66M parameters, ~40% smaller and ~60%
+faster than BERT) that you *fine-tune*: take the pretrained model, add a
+9-way classification head, and train it on labelled pages. Concretely:
+
+1. **Get labels.** Three sources, cheapest first: (a) *silver* labels — pages
+   where the rules are highly confident **and** the SimilarWeb prior agrees
+   (free, thousands available); (b) *LLM labels* — run Claude once over
+   5–20k diverse pages via the Batch API and keep its verdicts (distillation:
+   the big model teaches the small one); (c) a *gold* hand-labelled set of
+   300–500 pages, reserved purely for evaluation, never training.
+2. **Build the input text.** One string per page from the same evidence the
+   rules read, e.g.
+   `url: sephora com shop moisturizer [SEP] title: Moisturizers | Sephora
+   [SEP] schema: itemlist [SEP] text: <first ~150 words>` — truncated to
+   256–512 tokens. Including the tokenized URL is essential: it lets the same
+   model still work when fetching failed.
+3. **Train.** HuggingFace `transformers` `Trainer` on
+   `distilbert-base-uncased`: learning rate 2e-5–5e-5, batch 16–32, 3–5
+   epochs, class-weighted loss (the category distribution is very skewed).
+   Minutes on a free Colab GPU. Optionally one shared encoder with **two
+   heads** — `page_category` and `seller_type` — trained jointly.
+4. **Evaluate honestly.** Per-class F1 on the gold set (accuracy alone hides
+   minority-class failures), compared against the rule baseline through the
+   same `pipeline.evaluate` harness.
+5. **Integrate as a tier.** A `classify_distilbert()` that follows the
+   module's auto-resolution pattern: if `transformers` + a checkpoint path in
+   config are present, run it on pages where rules are unsure (or on all
+   fetched pages) and record `classifier_method="distilbert"`; otherwise fall
+   back to rules. Rules still win on transactional URL tokens — those are
+   near-deterministic.
+6. **Make it fast.** Export to ONNX + int8 quantization: ~5–15 ms/page on
+   CPU, so 265k URLs classify in under an hour with batching — no GPU needed
+   at inference time.
+
+Related advanced options, roughly in order of effort: **SetFit** (few-shot
+fine-tuning of a sentence-transformer; strong with as few as ~8–50 labels per
+class — the best label-efficiency if you only hand-label a small gold set);
+**LightGBM/XGBoost over the engineered features** the module already logs
+(votes per modality, word_count, has_price, schema types — interpretable and
+often embarrassingly competitive); a **URL-only character model** trained on
+URLs alone (covers every unfetchable page, pairs naturally with the
+content model); **MarkupLM**-style DOM-aware transformers that read HTML
+structure, the academic state of the art for web-page classification; and
+**screenshot + vision models** for JavaScript-heavy pages, at the cost of
+running a renderer.
 
 ### Product ↔ chat matching
 

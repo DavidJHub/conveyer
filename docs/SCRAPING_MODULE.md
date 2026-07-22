@@ -1,0 +1,511 @@
+# The scraping module, explained (`conveyer/scraping`)
+
+A plain-language walkthrough of module 2: what each step does, **which
+technology it uses**, why it was built that way, where to look when
+troubleshooting, what to improve, and what the alternatives are.
+Companion docs: [`SCRAPED_PAGES_SCHEMA.md`](SCRAPED_PAGES_SCHEMA.md) (the
+output tables, column by column) and [`DATA_DICTIONARY.md`](DATA_DICTIONARY.md)
+(the input data).
+
+---
+
+## 0 · What this module does, in one paragraph
+
+The conversations dataset gives us a list of **URLs** — links the AI agent
+showed, links the user clicked, and the next pages they browsed. This module
+**downloads each page, reads it, and answers three questions**: *What kind of
+page is this?* (brand homepage, product page, cart, review article, …), *Who is
+selling here?* (the brand itself, or a retailer like Amazon/Sephora), and *Does
+the product on this page match what the agent recommended in the chat?* The
+answers become two parquet tables (`scraped_pages`, `scraped_products`) that
+module 3 (`journey.py`) uses to measure conversion.
+
+```mermaid
+flowchart LR
+    A[URL list<br/>sources.py] --> B[Download<br/>fetch.py]
+    B --> C[Parse HTML<br/>extract.py]
+    C --> D[Find products<br/>products.py]
+    C --> E[Classify page<br/>classify.py + taxonomy.py]
+    D --> F[Match products<br/>to chat mentions<br/>products.py]
+    E --> G[Save rows<br/>schema.py]
+    F --> G
+    G --> H[(scraped_pages.parquet<br/>scraped_products.parquet)]
+    P[pipeline.py<br/>orchestrates everything] -.-> A & B & G
+```
+
+One config object (`ScrapeConfig` in `config.py`) controls all of it —
+timeouts, thresholds, file paths, which classifier to use. Change behaviour
+there, not inside the step files.
+
+---
+
+## 1 · The pipeline, step by step
+
+### Step 1 — Build the URL list (`sources.py`)
+
+**What it does.** Reads the input parquet(s) and produces one row per distinct
+URL, with *provenance*: how many times it was surfaced, whether the agent
+recommended it, whether the user visited it, which chat turns (`message_id`s)
+it belongs to, and dwell time (how long the user stayed, computed from the
+`request_time` gaps between consecutive trail entries). It also builds the
+**mentions map**: for each chat turn, which brands/categories/products the
+agent talked about (from `fact_ai_recommendation` + `fact_ai_concept`).
+
+**What it uses.** Just **pandas** — reading parquet files, looping rows,
+grouping by URL. No scraping happens here.
+
+**In plain terms.** Before going shopping, write the shopping list. This step
+turns messy event logs into a clean to-do list of URLs, and keeps a cheat
+sheet of "what the agent said" next to each one so step 6 can compare.
+
+**Troubleshooting.** If URL counts look wrong, this is the file. It accepts
+either a directory of SimilarWeb star-schema parquets *or* a single
+`conversations.parquet` — table names are matched by filename hints
+(`_TABLE_HINTS`). `--only-recommended`, `--dedupe-by domain`, `--max-urls`
+filter the list here.
+
+### Step 2 — Download each page (`fetch.py`)
+
+**What it does.** Fetches the HTML of each URL, politely and safely:
+
+| Behaviour | Setting | Default |
+|---|---|---|
+| Obey `robots.txt` (the file where sites say what bots may visit) | `respect_robots` | on |
+| Identify honestly | `user_agent` | research-bot string |
+| Max 1 request per second per domain | `rate_limit_per_domain` | 1.0 s |
+| Retry transient failures, doubling the wait | `max_retries`, `retry_backoff` | 2 retries, 2 s |
+| Give up on any URL after a wall-clock cap | `hard_timeout` | 30 s |
+| Stop reading bodies past a size cap | `max_bytes` | 2 MB |
+| Only accept HTML | `allowed_content_types` | text/html |
+| Save every fetch to disk, never re-hit a site | `cache_dir`, `use_cache` | on |
+
+**What it uses.** The **`requests`** library (the standard Python HTTP
+client) for downloads; **`concurrent.futures.ThreadPoolExecutor`** (standard
+library) to run 8 downloads in parallel; **`urllib.robotparser`** (standard
+library) to *parse* robots.txt — but the file itself is fetched with a bounded
+timeout, because the stdlib reader can hang forever on a dead host. The cache
+is one JSON file per URL, named by a SHA-256 hash of the URL.
+
+**In plain terms.** Eight polite couriers knock on doors in parallel. Each
+courier checks the "no soliciting" sign (robots.txt), waits their turn at
+each house (rate limit), gives up after 30 seconds no matter what
+(hard timeout), and photocopies everything they receive (cache) so nobody
+ever has to knock twice.
+
+**Two modes.** `offline=True` (default) serves pages from an in-memory corpus
+(the synthetic generator, or the disk cache) — nothing touches the network.
+`--online` does real fetching. This is why the whole pipeline runs in CI and
+notebooks with no connectivity.
+
+**Troubleshooting.** Every outcome is recorded on the page row:
+`fetch_status` (`ok` / `cached` / `error` / `skipped` / `offline_miss` /
+`robots_blocked`), `http_status`, `fetch_error`. Start any debugging session
+with `pages.fetch_status.value_counts()`.
+
+### Step 3 — Parse the HTML (`extract.py`)
+
+**What it does.** Turns the raw HTML string into a structured `PageContent`
+object: title, meta description, OpenGraph tags, headings (h1/h2/h3), visible
+text, all links and images, language, canonical URL — and, crucially, the
+**machine-readable product data** many shops embed: `application/ld+json`
+blocks (JSON-LD) and microdata attributes.
+
+**What it uses.** Two interchangeable parsers. Default: a subclass of the
+standard library's **`html.parser.HTMLParser`** (zero dependencies). If
+**BeautifulSoup + lxml** are installed, it upgrades to them automatically
+(`html_parser="auto"`); they are more tolerant of broken HTML and faster.
+JSON-LD blocks are decoded with the standard **`json`** module.
+
+**In plain terms.** A page is a letter written in HTML. This step opens the
+envelope and sorts the contents into labelled trays: "headline", "summary",
+"body text", "links", and — the gold tray — "structured product data",
+which is the same machine-readable format (schema.org) that shops write
+specifically so Google Shopping can read their prices.
+
+**Troubleshooting.** The `parser` column says which backend parsed each page.
+If a page fetched OK but `word_count ≈ 0` and no JSON-LD, the site probably
+renders with JavaScript — the HTML we downloaded is an empty shell (see
+§5, improvement 1).
+
+### Step 4 — Extract products (`products.py`, `extract_products`)
+
+**What it does.** Pulls a list of `ProductRecord`s (name, brand, price,
+currency, rating, review count, SKU, availability, image, category) out of the
+parsed page. It tries sources **from most to least reliable**:
+
+1. **JSON-LD `schema.org/Product`** objects (and `ItemList`s of them) — the
+   structured data shops publish for search engines; richest and most exact.
+2. **Microdata** (`itemscope`/`itemprop` attributes) — an older way of
+   embedding the same schema.org data inline.
+3. **OpenGraph `product:*` meta tags** — the tags used for link previews;
+   name/price/brand only.
+4. **Heuristic** — last resort: if the visible text contains a price pattern
+   (`$12.99`, `€9`, regex `_PRICE_RE`), take the H1/title as the product name.
+
+Duplicates are collapsed on (name, price), keeping the record with the most
+filled fields. Capped at `max_products_per_page = 40`.
+
+**What it uses.** Pure Python + **regular expressions**. No ML, no network.
+The order *is* the design: degrade gracefully instead of returning nothing.
+
+**In plain terms.** First read the shop's official price tag (JSON-LD); if
+missing, the handwritten tag (microdata); then the shop-window sticker
+(OpenGraph); and if all else fails, squint at the page text for anything that
+looks like "$19.99". The `extraction_source` column tells you which one won.
+
+### Step 5 — Classify the page (`classify.py` + `taxonomy.py`)
+
+This is the heart of the module, and the most likely place you'll tune.
+
+**What it does.** Assigns each page:
+
+* `page_category` — one of **brand_landing / catalogue / shopping /
+  editorial / search / community / reference / unrelated / unknown**;
+* `page_subtype` — the finer structural role (pdp, cart, checkout, serp,
+  collection, article, forum, …);
+* `seller_type` — `brand_owned` vs `retailer` (only for commerce pages);
+* `funnel_stage` — Discovery / Evaluation / Intent / Purchase / …, mapped from
+  the category+subtype in `taxonomy.py`;
+* `skincare_relevance` (0–1) and `is_study_relevant` — is this page on-topic?
+* `confidence`, and `classification_signals` — *which evidence fired*.
+
+**How it decides: four independent "voters".** Each modality scores subtypes
+with hand-set weights; votes are summed; the highest-scoring subtype wins.
+
+| Voter | Evidence | Example | Tech |
+|---|---|---|---|
+| **URL structure** | tokens in path/query | `/cart` → cart (2.5), `/dp/` → pdp (2.0), `?q=` → serp (2.0) | regex |
+| **Domain knowledge** | registrable domain vs curated lists | `amazon.*` → retailer, `reddit.*` → community, `cerave.com` → brand site | Python sets in `classify.py` + the shared brand lexicon `conveyer/brands.py` |
+| **Page markup** | schema.org types, og:type, price/add-to-cart, product count | `@type: Product` → pdp; ≥3 products → collection | reads `PageContent` |
+| **Vendor prior** | SimilarWeb's own `page_type` label | `page_type=checkout` → +1.5 to checkout | weight `3.0 × prior_weight (0.5)` |
+
+Confidence is a **softmax** over the summed category scores — roughly "how
+much did the winner beat the runners-up".
+
+**The second axis: relevance.** Independently of *structure*, a keyword regex
+(`serum`, `retinol`, `SPF`, `moisturizer`, …) plus brand-mention checks score
+how *skincare-related* the page is. The two axes then combine with care:
+
+* An Amazon **cart** URL contains no skincare words *by nature* — carts,
+  checkouts, search pages and storefront homepages are **topic-neutral
+  journey infrastructure** and are never punished for it (but that status must
+  be *earned* by structural evidence — `sephora.com/careers` doesn't qualify).
+* A fetched **article** with zero skincare signal collapses to `unrelated`
+  (a confident judgement — it needs content to stand on).
+* An **unfetchable** `amazon.com/dp/…` keeps its earned "shopping" label
+  (the URL alone proves it); an unfetchable nothing-page falls to `unknown`.
+
+**The fallback chain (why blocked pages still classify).** Orchestrated in
+`pipeline.py::_process_one`, recorded in `fetch_scope`:
+
+1. `page` — the page itself was fetched: all four voters play.
+2. `base` — the deep link failed (bot wall, 404) → fetch the site's homepage
+   (`scheme://host/`) so domain-level content still informs the label.
+   Products are **not** extracted from the stand-in homepage.
+3. `none` — nothing fetchable: URL tokens + domain lists + vendor prior alone.
+   An unreachable Amazon cart is still, correctly, a cart.
+
+**Optional LLM refinement.** With `classifier="llm"`, or `"auto"` when rule
+confidence < 0.55, and the **`anthropic`** package + `ANTHROPIC_API_KEY`
+present, the page's URL/title/meta/H1/schema-types/first-800-chars go to a
+Claude model (`llm_model` in config, override with `ANTHROPIC_MODEL`), which
+returns a JSON verdict. Any API error silently falls back to the rule result.
+The `classifier_method` column records `rule`, `rule+prior`, or `llm`.
+
+**In plain terms.** Four witnesses look at each page — one reads only the
+address, one only recognises the neighbourhood, one only looks through the
+window, one only repeats what SimilarWeb said. They vote; the majority wins;
+we write down who voted (`classification_signals`) so every label can be
+audited. A separate question — "is this about skincare at all?" — can
+overrule the winner to `unrelated`, except for pages (carts, checkouts,
+search boxes) whose job never mentions skincare in the first place. If a
+verdict is shaky, optionally ask an expensive expert (the LLM).
+
+### Step 6 — Match products to the chat (`products.py`, `match_products`)
+
+**What it does.** For each product found on a page, compares it against every
+product the agent mentioned on the turn(s) that surfaced this URL, and keeps
+the best match:
+
+| Test | Score | Meaning |
+|---|---|---|
+| **SKU** exact match | 1.0 | same identifier — certain |
+| **Brand** match (normalized set/substring) | 0.75 + 0.25 × name-overlap | same brand, better if name agrees too |
+| **Name** token overlap ≥ 0.34 | 0.4 + 0.5 × overlap | similar wording |
+| **Category** token intersection | 0.3 | weak corroboration only |
+
+`coincides = match_score ≥ coincide_threshold (0.5)` — so in practice a
+SKU or brand match, or a strong name match. Name overlap is **Jaccard
+similarity**: shared words ÷ total distinct words, after lowercasing and
+dropping stop-words (`the`, `for`, `skincare`, `oz`, …).
+
+**What it uses.** Pure Python set operations + the shared `normalize()`
+helper (lowercase/trim) from `conveyer/ingest.py`. Deliberately simple —
+no fuzzy-matching library, no embeddings (yet; see §5).
+
+**In plain terms.** The agent said "try the CeraVe Moisturizing Cream". The
+user lands on a page selling "CeraVe Moisturizing Cream 19 oz". Same barcode?
+Match. Same brand? Very likely match. Half the words in common? Probably.
+Only the category ("a moisturizer")? Too weak to call a coincidence.
+
+### Step 7 — Save everything, crash-proof (`schema.py` + `pipeline.py`)
+
+**What it does.** Writes two tables with **pinned pyarrow schemas** (types
+declared explicitly, so nullable ints and list columns survive the parquet
+round-trip):
+
+* `scraped_pages.parquet` — one row per URL (~55 columns: URL parts, fetch
+  metadata, extracted info, classification, provenance, dwell).
+* `scraped_products.parquet` — one row per product, FK `page_id`.
+
+The write strategy makes long runs safe:
+
+* the moment a page finishes, its rows are **appended to `.jsonl` sidecars**
+  (products first, then the page line as the *commit marker* — so a crash
+  between the two writes can't leave orphan products);
+* parquet files are refreshed every `checkpoint_every = 500` pages **and on
+  exit, including Ctrl-C**;
+* with `resume=True` (default), a re-run reads the sidecar and **skips URLs
+  already done** — you can kill and restart a 265k-URL run freely.
+
+**What it uses.** **pyarrow** for parquet, plain file-append for JSONL,
+standard **`json`** for the lines. Results stream in "as completed" from the
+thread pool, so there is no batch barrier — one slow site never blocks the
+rest.
+
+**In plain terms.** A ship's logbook (JSONL) written line by line as events
+happen, plus a fair-copy report (parquet) retyped every 500 entries. If the
+ship sinks mid-sentence, you lose at most that one line, and the next voyage
+starts where the log ends.
+
+### Step 8 — Self-evaluation (`pipeline.py::evaluate` + `synthetic.py`)
+
+**What it does.** When running on the **synthetic corpus** — generated pages
+(brand sites, PDPs, editorials, off-topic pages) that carry ground-truth
+labels — the run scores itself: `category_accuracy`, `seller_accuracy`, and
+`coincide` accuracy/precision/recall.
+
+**What it uses.** pandas joins on the ground-truth frame; numpy for the
+synthetic generator.
+
+**In plain terms.** A practice exam with an answer key. It proves the
+machinery works end-to-end, but — important honesty note — **real pages are
+messier than synthetic ones**, so treat these numbers as an upper bound, not
+a promise (see §5, improvement 3).
+
+---
+
+## 2 · Technology inventory (one table)
+
+| Step | File | Technology | Type | Fallback if missing |
+|---|---|---|---|---|
+| URL list | `sources.py` | pandas | required | — |
+| Download | `fetch.py` | requests, ThreadPoolExecutor, urllib.robotparser | required (online only) | offline mode needs nothing |
+| Parse HTML | `extract.py` | html.parser (stdlib) / BeautifulSoup + lxml | stdlib / optional | stdlib parser |
+| Products | `products.py` | regex + json (stdlib) | stdlib | — |
+| Classify | `classify.py`, `taxonomy.py` | regex, curated domain sets, softmax (math stdlib) | stdlib | — |
+| LLM refine | `classify.py` | anthropic SDK + API key | optional | rule result |
+| Match | `products.py` | set ops, Jaccard overlap | stdlib | — |
+| Save | `schema.py` | pyarrow, JSONL | required | — |
+| Synthetic + eval | `synthetic.py`, `pipeline.py` | numpy, pandas | required | — |
+
+Only pandas/numpy/pyarrow/requests are hard requirements. Everything else
+degrades gracefully — that's the project's "graceful upgrades" principle.
+
+---
+
+## 3 · Troubleshooting: read the audit trail, not the code
+
+Every design decision leaves a column behind. When a label looks wrong, these
+six columns almost always explain it:
+
+| Column | Question it answers |
+|---|---|
+| `fetch_status` / `fetch_error` / `http_status` | Did we even get the page? (`error` + HTTP 403 = bot wall) |
+| `fetch_scope` | Did the label come from the page (`page`), the homepage stand-in (`base`), or the URL alone (`none`)? |
+| `classification_signals` | Which voters fired: `url` / `domain` / `markup` / `prior` / `content` / `base_content` / `llm` |
+| `classifier_method` | `rule`, `rule+prior`, or `llm` |
+| `page_category_confidence` | How decisive the vote was (softmax) |
+| `extraction_source` (products) | jsonld / opengraph / microdata / heuristic |
+
+Typical symptoms:
+
+* **Lots of `unknown`** → URLs with no fetch, no known domain, no telling
+  tokens. Check `fetch_status` first; consider the LLM pass for the residue.
+* **Fetched OK but empty (`word_count` ≈ 0, no products)** → JavaScript-only
+  site; the classifier fell back to URL/domain evidence. See improvement 1.
+* **`robots_blocked` on a domain you need** → the site forbids bots; decide
+  policy explicitly, don't just flip `respect_robots`.
+* **Everything `offline_miss`** → you're in offline mode without a corpus or
+  cache; add `--online` or point at cached data.
+* **A page classified from its homepage** (`fetch_scope="base"`) → correct
+  behaviour for blocked deep links; products deliberately absent.
+* **Weird `coincides`** → inspect `match_type` / `match_score` on the product
+  row and the mention's `matched_entity`; tune `coincide_threshold` /
+  `match_name_threshold` in config.
+
+Also useful: the JSONL sidecars in `outputs/scrape/` are human-readable —
+`tail -f scraped_pages.jsonl` during a run shows live progress; the cache in
+`outputs/scrape_cache/` holds the raw HTML of every fetched page for replay.
+
+---
+
+## 4 · Concepts worth researching (your homework list)
+
+Ranked: the first five give you 80% of the mental model.
+
+1. **schema.org, JSON-LD, microdata, OpenGraph** — the machine-readable
+   product data shops embed for Google; the #1 source of our product records.
+   Search: *"JSON-LD Product schema"*, view-source any Sephora product page.
+2. **robots.txt & crawl politeness** — what sites allow bots to do, and the
+   etiquette (rate limits, user agents) this module implements.
+3. **HTTP basics** — status codes (200/301/403/404/429), redirects,
+   Content-Type; explains most `fetch_error` values.
+4. **HTML parsing & the DOM** — what BeautifulSoup actually does; enough to
+   read `extract.py`.
+5. **Jaccard similarity & token overlap** — the matching math in one formula.
+6. **Registrable domain / Public Suffix List** — why `amazon.co.uk` needs
+   special handling (`_MULTI_TLD` is a hand-rolled mini-version of this).
+7. **Softmax** — how vote scores become a 0–1 confidence.
+8. **JSONL + parquet** — the two storage formats and why each is used where.
+9. **Weak supervision / priors** — using SimilarWeb's noisy `page_type` label
+   as a nudge rather than the truth.
+10. **Headless browsers & anti-bot** (for the improvement work) — why
+    JavaScript sites return empty HTML and what Playwright does about it;
+    what Cloudflare/PerimeterX walls are.
+
+---
+
+## 5 · Known weaknesses → concrete improvements (ranked)
+
+1. **JavaScript-rendered pages come back empty.** `requests` gets only the
+   initial HTML; React/Vue storefronts ship an empty shell. Today those pages
+   quietly fall back to URL/domain evidence.
+   *Improvement:* detect the symptom (`fetch_status=ok` but `word_count<50`
+   and no JSON-LD) and re-fetch just those through **Playwright** (headless
+   Chromium) or a rendering API. Keep it a fallback tier — rendering is
+   10–100× slower than plain HTTP.
+2. **Big retailers block bots.** Amazon/Sephora/Ulta often answer 403 or a
+   CAPTCHA page. The base-URL fallback + URL heuristics absorb the
+   *classification* damage, but product extraction is lost exactly where
+   purchases happen.
+   *Improvement:* accept it for the study (URL evidence suffices for funnel
+   stage), or use official affiliate/product APIs for the top few domains, or
+   a commercial scraping API (see §6) for that shortlist only.
+3. **Evaluation only exists on synthetic data.** The generator's pages are
+   clean; real accuracy is unknown.
+   *Improvement:* hand-label 200–500 *real* pages (stratified by domain and
+   category), store them as a labelled parquet, and extend
+   `pipeline.evaluate` to score against them. This single artefact makes
+   every other improvement measurable.
+4. **Hand-tuned vote weights.** The 2.5-vs-1.6 style weights in
+   `classify.py` are sensible but arbitrary, and `min_confidence` is unused
+   in anger.
+   *Improvement:* the per-modality votes are already logged — once you have
+   labelled real pages (item 3), fit a **logistic regression (scikit-learn,
+   already a dependency)** over the vote vector. You keep full auditability
+   and gain calibrated confidence.
+5. **Curated domain lists are static and US/skincare-centric.** New
+   retailers, non-US domains, and new communities silently miss.
+   *Improvement:* swap `_MULTI_TLD` for **`tldextract`** (uses the real
+   Public Suffix List), and log "high-traffic domain not in any list" during
+   runs so the lists grow from data.
+6. **Token-overlap matching is brittle.** "Vitamin C serum" vs "Ascorbic
+   Acid 15%": zero overlap, same product.
+   *Improvement (cheap):* **rapidfuzz** string similarity as an extra
+   channel. *Improvement (better):* sentence embeddings — `conveyer/models.py`
+   already auto-resolves an embedding backend; cosine-match
+   `product.name + brand` vs `entity_context`.
+7. **LLM refinement is per-page and synchronous.** Fine for hundreds, costly
+   for 265k.
+   *Improvement:* batch the low-confidence residue through the **Anthropic
+   Batch API** (half price, async), cache verdicts by `(domain, subtype)`,
+   and use a small fast model — page-type classification doesn't need a
+   frontier model.
+8. **URL noise inflates the workload.** Tracking parameters
+   (`utm_*`, `ref_=`, `fbclid`) make one page look like many URLs.
+   *Improvement:* canonicalize URLs (strip known tracking params, sort query
+   keys) in `sources.py` before deduping — fewer fetches, cleaner joins.
+
+---
+
+## 6 · Alternatives, layer by layer
+
+The module deliberately builds each layer from primitives. Here is the map of
+what you could swap in, and when it's worth it.
+
+### Fetching
+
+| Option | What it is | Worth switching when… |
+|---|---|---|
+| `requests` + threads (**current**) | simple, synchronous HTTP, 8 workers | fine up to ~10⁵ URLs; you are here |
+| `httpx` / `aiohttp` (async) | same job, one event loop instead of threads | you want 50–200 concurrent fetches cheaply |
+| **Scrapy** | a full crawling *framework*: scheduler, auto-throttle, middlewares, retry policies | scraping becomes a permanent, growing operation |
+| **Playwright / Selenium** | drives a real browser, executes JavaScript | the JS-empty-page problem (improvement 1) |
+| Hosted scraping APIs (Zyte, ScrapingBee, Firecrawl, Bright Data, Apify) | they fetch for you: proxies, rendering, anti-bot handled, per-request pricing | a shortlist of high-value blocked domains justifies paying |
+| **Common Crawl** | free monthly crawl of the web, downloadable | you'd accept stale snapshots to avoid fetching at all |
+
+### Parsing / extraction
+
+| Option | What it is | Worth switching when… |
+|---|---|---|
+| stdlib parser → bs4+lxml (**current**, auto) | generic HTML → structured fields | works; keep |
+| **extruct** | dedicated structured-data extractor (JSON-LD, microdata, RDFa, OpenGraph) | you want to replace the hand-rolled JSON-LD/microdata code with the community standard |
+| **selectolax** | very fast C-based HTML parser | parsing ever becomes the bottleneck (unlikely; network dominates) |
+| **trafilatura** | main-article text extraction (strips nav/boilerplate) | cleaner text would help relevance scoring and the LLM prompt |
+
+### Classification
+
+| Option | What it is | Trade-off vs current rules |
+|---|---|---|
+| Multimodal rules (**current**) | four voters, hand weights | transparent, free, instant; plateaus in accuracy |
+| Rules + **learned weights** (logistic regression) | same features, fitted weights | small step, big win once labels exist (improvement 4) |
+| **Embeddings + centroid/kNN** | embed URL+title+text, compare to category descriptions | handles unseen phrasing; needs an embedding backend (already in `models.py`) |
+| **LLM zero-shot** (current optional path) | ask a model per page | best accuracy on weird pages; cost/latency — use only on the low-confidence residue |
+| **Fine-tuned small transformer** (e.g. DistilBERT) | train on a few thousand labels | fast + accurate at scale; most engineering effort |
+
+The pragmatic architecture — and the one this module already sketches — is a
+**cascade**: cheap rules label the easy 80–90%, and only the low-confidence
+remainder escalates to embeddings or an LLM.
+
+### Product ↔ chat matching
+
+| Option | Trade-off |
+|---|---|
+| Token Jaccard (**current**) | free, explainable, misses synonyms |
+| **rapidfuzz** | one dependency, catches typos/word-order, still no semantics |
+| Embedding cosine similarity | catches "Vitamin C" ≈ "Ascorbic Acid"; needs backend + threshold tuning |
+| Entity resolution (splink, dedupe) | industrial-strength record linkage; overkill at this scale |
+
+### Storage
+
+JSONL + pyarrow parquet (**current**) is the right call at this scale. If you
+ever want SQL over live results mid-run, **DuckDB** reads both files directly
+(`select * from 'outputs/scrape/scraped_pages.jsonl'`) — an addition, not a
+replacement.
+
+---
+
+## 7 · Cheat sheet
+
+```bash
+# offline, synthetic corpus, self-scoring — the safe default
+python -m conveyer.scraping
+
+# real data, polite online scraping, capped for a test run
+python -m conveyer.scraping --clickstream-dir data/conversations.parquet \
+    --online --max-urls 500 --hard-timeout 30
+
+# resume after Ctrl-C (default behaviour — just rerun the same command)
+# start over instead:
+python -m conveyer.scraping ... --no-resume
+
+# quick interactive check of the URL-only classifier
+python -c "from conveyer.scraping import classify_url; \
+print(classify_url('https://www.amazon.com/gp/cart/view.html'))"
+```
+
+Flags that matter while troubleshooting: `--max-urls` (small test batches),
+`--dedupe-by domain` (one page per site — fast coverage check),
+`--classifier rule` (disable the LLM to isolate rule behaviour),
+`--parser stdlib` (isolate bs4 differences), `--no-cache` (force refetch).

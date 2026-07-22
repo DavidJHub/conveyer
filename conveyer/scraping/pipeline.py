@@ -39,6 +39,7 @@ import pandas as pd
 
 from .classify import PageClass, classify_page
 from .config import ScrapeConfig
+from .directory import directory_content, lookup
 from .extract import PageContent, extract_page
 from .fetch import Fetcher, FetchResult, _cache_path, base_url_of
 from .products import extract_products, match_products
@@ -134,7 +135,11 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
        x.com/…/status/… → x.com/ — so domain-level content still informs
        relevance/category (``fetch_scope="base"``; cache makes this ~free since
        base pages repeat across thousands of deep links);
-    3. URL + domain heuristics alone (``fetch_scope="none"``).
+    3. the **domain directory** when nothing is fetchable at all —
+       robots_blocked, bot walls, dead hosts — the directory's description of
+       the site stands in as domain-level content (``fetch_scope="directory"``;
+       see :mod:`conveyer.scraping.directory`);
+    4. URL + domain heuristics alone (``fetch_scope="none"``).
     """
     url = row_d.get("url") or fr.url
     try:
@@ -148,16 +153,25 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
                 if frb.ok:
                     content = extract_page(frb.html, url=url, parser=cfg.html_parser)
                     scope = "base"
-        # products only from the page itself — a homepage's markup must not be
-        # attributed to a deep link it stands in for
+        entry = lookup(url, cfg.directory_path) if cfg.directory_fallback else None
+        if scope == "none" and entry is not None and entry.description:
+            # the page is off-limits (robots/bot wall/dead host) but the *site*
+            # is known — its directory description stands in as content
+            content = directory_content(entry, url)
+            scope = "directory"
+        # products only from the page itself — a homepage's or the directory's
+        # markup must not be attributed to a deep link it stands in for
         products = extract_products(content, cfg.max_products_per_page) \
             if scope == "page" else []
         chat_brands = chat_brands_for(row_d, src.mentions)
         mentions = mentions_for(row_d, src.mentions)
         cls = classify_page(content, url, cfg, prior=_prior_for(cfg, row_d),
-                            n_products=len(products), chat_brands=chat_brands)
+                            n_products=len(products), chat_brands=chat_brands,
+                            content_scope=scope, directory_entry=entry)
         if scope == "base":
             cls.signals = [s for s in cls.signals if s != "content"] + ["base_content"]
+        elif scope == "directory":
+            cls.signals = [s for s in cls.signals if s != "content"] + ["directory_content"]
         mid = (row_d.get("message_ids") or [""])[0]
         match_products(products, cls.primary_brand, mentions, message_id=str(mid),
                        coincide_threshold=cfg.coincide_threshold,

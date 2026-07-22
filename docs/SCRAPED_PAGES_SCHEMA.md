@@ -62,15 +62,20 @@ distribution (search 46k · marketplace 6.7k · category 6.4k rows) plus the
 editorial/community pages that dominate skincare discovery don't fit the three
 requested buckets, and each occupies a distinct funnel position.
 
-**The classifier is multimodal, with a fallback chain.** Four independent
+**The classifier is multimodal, with a fallback chain.** Five independent
 evidence channels vote — URL tokens (`/cart/`, `checkout`, `/dp/…`, `?q=`),
 domain knowledge (curated retailer / search / community / editorial /
 reference / brand lists, brand domains from `conveyer.brands`), page content &
-markup (schema.org, OpenGraph, price/cart signals), and the vendor prior when
-present — and **any one can carry a page alone**. When the page itself is
-unreachable, the fetcher falls back to the **base URL** (`scheme://host/`,
-`fetch_scope="base"`) so domain-level content still informs relevance; when
-that fails too, URL + domain heuristics decide alone (`fetch_scope="none"`).
+markup (schema.org, OpenGraph, price/cart signals), the vendor prior when
+present, and the **domain directory** (`conveyer/scraping/directory.py`: a
+role + description per known domain, extensible via
+`ScrapeConfig.directory_path`) — and **any one can carry a page alone**. When
+the page itself is unreachable, the fetcher falls back to the **base URL**
+(`scheme://host/`, `fetch_scope="base"`) so domain-level content still informs
+relevance; when that fails too (robots_blocked, bot walls, dead hosts) the
+directory's **description of the domain stands in as content**
+(`fetch_scope="directory"`); with no directory entry either, URL + domain
+heuristics decide alone (`fetch_scope="none"`).
 `classification_signals` records which modalities fired. So
 `amazon.com/gp/cart/view.html?ref_=nav_cart` classifies as
 `shopping · cart · retailer · Purchase` with zero fetched content: the domain
@@ -164,8 +169,8 @@ erDiagram
 | `fetched_at` | string | UTC ISO timestamp |
 | `fetch_error` | string | error detail when `fetch_status != ok` |
 | `from_cache` | bool | served from the on-disk fetch cache |
-| `fetch_scope` | string | where the content came from: `page` (the URL itself) · `base` (**base-URL fallback** — the deep link was unreachable, so `scheme://host/` was fetched instead and stands in for domain-level evidence; `x.com/…/status/…` → `x.com/`) · `none` (URL/domain heuristics only) |
-| `parser` | string | `stdlib` or `bs4` (auto-upgrades when installed) |
+| `fetch_scope` | string | where the content came from: `page` (the URL itself) · `base` (**base-URL fallback** — the deep link was unreachable, so `scheme://host/` was fetched instead and stands in for domain-level evidence; `x.com/…/status/…` → `x.com/`) · `directory` (**domain-directory fallback** — nothing was fetchable, the offline directory's description of the domain stands in) · `none` (URL/domain heuristics only) |
+| `parser` | string | `stdlib` or `bs4` (auto-upgrades when installed) · `directory` for directory stand-ins |
 
 ### Extracted page info ("all the info of the web page we can")
 

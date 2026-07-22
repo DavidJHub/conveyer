@@ -374,6 +374,89 @@ def test_base_url_fallback():
 
 
 # --------------------------------------------------------------------------- #
+# Domain-directory fallback (robots_blocked / bot walls / dead hosts)
+# --------------------------------------------------------------------------- #
+def test_directory_seed_and_content():
+    from conveyer.scraping.directory import directory_content, lookup
+    e = lookup("https://www.amazon.co.uk/gp/cart/view.html")
+    _check(e is not None and e.role == "marketplace", f"amazon entry: {e}")
+    e2 = lookup("sephora.com")
+    _check(e2 is not None and "skincare" in e2.description.lower(),
+           "beauty retailer description must carry topical words")
+    pc = directory_content(e2, "https://www.sephora.com/x")
+    _check(bool(pc.text) and pc.parser == "directory", "stand-in content")
+    _check(lookup("https://nobody-knows-this-site.xyz/") is None, "unknown -> None")
+
+
+def test_directory_robots_blocked_fallback():
+    """A robots-blocked URL on a known domain classifies from the directory's
+    description (fetch_scope='directory'); the description supplies relevance
+    but must never mint a category the URL didn't structurally earn."""
+    from conveyer.scraping.fetch import FetchResult
+    from conveyer.scraping.pipeline import _process_one
+    from conveyer.scraping.sources import ScrapeSources
+
+    cfg = ScrapeConfig()                      # offline, empty corpus
+    src = ScrapeSources(urls=pd.DataFrame(), mentions={})
+    fetcher = Fetcher(cfg, html_by_url={})    # base fallback will offline_miss
+
+    url = "https://www.sephora.com/shop/face-cream"
+    fr = FetchResult(url=url, status="robots_blocked")
+    pr, prods = _process_one(cfg, src, {"url": url}, fr, fetcher)
+    _check(pr["fetch_scope"] == "directory", f"scope {pr['fetch_scope']}")
+    _check(pr["page_category"] == "catalogue", f"blocked /shop -> {pr['page_category']}")
+    _check(pr["seller_type"] == "retailer", f"seller {pr['seller_type']}")
+    _check(pr["is_study_relevant"], "beauty-retailer description supplies relevance")
+    _check("directory_content" in list(pr["classification_signals"]),
+           f"signals {pr['classification_signals']}")
+    _check(prods == [], "no products may come from a directory stand-in")
+
+    # no structural evidence in the URL -> the description alone is not enough
+    url2 = "https://www.sephora.com/careers"
+    pr2, _ = _process_one(cfg, src, {"url": url2},
+                          FetchResult(url=url2, status="robots_blocked"), fetcher)
+    _check(pr2["page_category"] == "unknown", f"blocked /careers -> {pr2['page_category']}")
+
+    # blocked cart on a marketplace: transactional URL token stays decisive
+    url3 = "https://www.amazon.com/gp/cart/view.html?ref_=nav_cart"
+    pr3, _ = _process_one(cfg, src, {"url": url3},
+                          FetchResult(url=url3, status="robots_blocked"), fetcher)
+    _check(pr3["fetch_scope"] == "directory", f"scope {pr3['fetch_scope']}")
+    _check(pr3["page_category"] == "shopping" and pr3["page_subtype"] == "cart",
+           f"{pr3['page_category']}/{pr3['page_subtype']}")
+    _check(pr3["funnel_stage"] == "Purchase", f"funnel {pr3['funnel_stage']}")
+
+
+def test_directory_external_file_extends_lists():
+    """External JSON entries behave like curated domains: role votes fire (the
+    'directory' signal), seller_type resolves, and neutrality is earned."""
+    from conveyer.scraping.directory import lookup
+    from conveyer.scraping.extract import PageContent
+
+    tmp = tempfile.mkdtemp(prefix="conveyer_dir_")
+    try:
+        path = os.path.join(tmp, "domain_directory.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"glowmarket.com": {
+                "name": "GlowMarket", "role": "retailer",
+                "category": "beauty_and_cosmetics",
+                "description": "Online beauty retailer selling skincare and cosmetics."}}, fh)
+        entry = lookup("https://glowmarket.com/cart", path)
+        _check(entry is not None and entry.role == "retailer" and entry.source == "file",
+               f"external entry: {entry}")
+        cfg = ScrapeConfig(directory_path=path)
+        url = "https://glowmarket.com/cart"
+        r = classify_rule(PageContent(url=url), url, cfg, directory_entry=entry)
+        _check(r.page_category == "shopping" and r.page_subtype == "cart",
+               f"{r.page_category}/{r.page_subtype}")
+        _check(r.seller_type == "retailer", f"seller {r.seller_type}")
+        _check(r.funnel_stage == "Purchase", f"funnel {r.funnel_stage}")
+        _check("directory" in r.signals, f"role votes must fire: {r.signals}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # Incremental persistence & resume
 # --------------------------------------------------------------------------- #
 def test_incremental_jsonl_and_resume():

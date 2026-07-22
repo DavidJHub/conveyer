@@ -37,7 +37,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from .classify import PageClass, classify_page
+from .classify import PageClass, classify_page, is_transactional_url
 from .config import ScrapeConfig
 from .directory import directory_content, lookup
 from .extract import PageContent, extract_page
@@ -160,8 +160,11 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
             content = directory_content(entry, url)
             scope = "directory"
         # products only from the page itself — a homepage's or the directory's
-        # markup must not be attributed to a deep link it stands in for
-        products = extract_products(content, cfg.max_products_per_page) \
+        # markup must not be attributed to a deep link it stands in for; and on
+        # transactional URLs (cart/checkout) the text-price heuristic is off,
+        # so cart furniture can't become a phantom product
+        products = extract_products(content, cfg.max_products_per_page,
+                                    include_heuristic=not is_transactional_url(url)) \
             if scope == "page" else []
         chat_brands = chat_brands_for(row_d, src.mentions)
         mentions = mentions_for(row_d, src.mentions)
@@ -270,6 +273,20 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
     print("[categories]\n" + dist.to_string())
     n_coin = int(products_df["coincides"].sum()) if len(products_df) else 0
     print(f"[match] products={len(products_df)} | coincide={n_coin}")
+
+    # URL-rule double check: any unrelated/unknown row a decisive URL verdict
+    # contradicts is a classifier gap — surface it on every run
+    try:
+        from .validate import validation_report
+        vrep = validation_report(pages_df, cfg)
+        if len(vrep):
+            print(f"[validate] {len(vrep)} label(s) disagree with the URL rules — "
+                  f"inspect/repair: python -m conveyer.scraping.validate "
+                  f"{cfg.pages_path()} --apply")
+        else:
+            print("[validate] all labels consistent with the URL rules")
+    except Exception as exc:
+        print(f"[validate] skipped: {type(exc).__name__}: {exc}")
 
     evaluation = evaluate(pages_df, products_df, src.ground_truth)
     if evaluation:

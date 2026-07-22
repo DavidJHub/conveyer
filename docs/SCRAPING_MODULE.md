@@ -183,6 +183,18 @@ with hand-set weights; votes are summed; the highest-scoring subtype wins.
 Confidence is a **softmax** over the summed category scores — roughly "how
 much did the winner beat the runners-up".
 
+**One veto rule: decisive transactional URL tokens win outright.** A page
+under `/cart/`, `/checkouts/`, `/gp/cart`, `/order-history` *is* that page no
+matter how product-like its body looks — cart pages necessarily show prices
+and checkout buttons, so those markup signals are furniture, not counter-
+evidence. (This is the lesson of a real bug: Amazon's
+`/cart/add-to-cart/…` page scored pdp 3.5 from its own furniture vs cart 2.5
+from the URL and collapsed to `unrelated`.) When the override fires it is
+recorded as `url_override` in `classification_signals`, and the heuristic
+product extractor is disabled on such URLs so cart furniture can't mint a
+phantom product. Weak *query* hints (`?ref_=nav_cart`) stay advisory — a real
+PDP reached from the cart button is still a PDP.
+
 **The second axis: relevance.** Independently of *structure*, a keyword regex
 (`serum`, `retinol`, `SPF`, `moisturizer`, …) plus brand-mention checks score
 how *skincare-related* the page is. The two axes then combine with care:
@@ -336,7 +348,7 @@ six columns almost always explain it:
 |---|---|
 | `fetch_status` / `fetch_error` / `http_status` | Did we even get the page? (`error` + HTTP 403 = bot wall) |
 | `fetch_scope` | Did the label come from the page (`page`), the homepage stand-in (`base`), the domain directory's description (`directory`), or the URL alone (`none`)? |
-| `classification_signals` | Which voters fired: `url` / `domain` / `markup` / `prior` / `content` / `base_content` / `llm` |
+| `classification_signals` | Which voters fired: `url` / `domain` / `markup` / `prior` / `content` / `base_content` / `directory` / `directory_content` / `llm`; audit markers: `url_override` (transactional URL beat the markup vote), `url_validated` (repaired by the validate tool) |
 | `classifier_method` | `rule`, `rule+prior`, or `llm` |
 | `page_category_confidence` | How decisive the vote was (softmax) |
 | `extraction_source` (products) | jsonld / opengraph / microdata / heuristic |
@@ -359,6 +371,24 @@ Typical symptoms:
 * **Weird `coincides`** → inspect `match_type` / `match_score` on the product
   row and the mention's `matched_entity`; tune `coincide_threshold` /
   `match_name_threshold` in config.
+
+**The URL-rule double check (`validate.py`).** Because the URL channel is the
+most trustworthy voter for structural roles, every stored label can be
+re-audited against it — no re-scrape needed:
+
+```bash
+python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet          # report
+python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet --apply  # repair in place
+```
+
+It flags (and with `--apply`, repairs) two mismatch kinds: a stored
+`unrelated`/`unknown` row whose URL alone proves a journey page, and a
+`shopping` row whose URL carries a decisive cart/checkout token but whose
+stored subtype disagrees (Intent vs Purchase — this moves the conversion
+proxy). Repairs are audited: `classifier_method` gains `+url_validated` and
+the signal list gains `url_validated`. `run_scrape` also prints a
+`[validate]` summary at the end of every run, so this class of regression
+can't ship silently.
 
 Also useful: the JSONL sidecars in `outputs/scrape/` are human-readable —
 `tail -f scraped_pages.jsonl` during a run shows live progress; the cache in
@@ -568,6 +598,9 @@ python -m conveyer.scraping ... --no-resume
 # quick interactive check of the URL-only classifier
 python -c "from conveyer.scraping import classify_url; \
 print(classify_url('https://www.amazon.com/gp/cart/view.html'))"
+
+# double-check existing labels against the URL rules; --apply repairs them
+python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet
 ```
 
 Flags that matter while troubleshooting: `--max-urls` (small test batches),

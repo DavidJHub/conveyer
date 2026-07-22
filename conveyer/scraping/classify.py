@@ -191,6 +191,34 @@ TOPIC_NEUTRAL_SUBTYPES = {"cart", "checkout", "order", "serp", "site_search",
 # live: /checkouts/c/<token> on an unheard-of Shopify store is still a checkout.
 TRANSACTIONAL_SUBTYPES = {"cart", "checkout", "order", "wishlist"}
 
+# A path-anchored transactional vote at or above this weight is treated as
+# near-deterministic: /cart/, /checkouts/, /gp/cart, order-history. The weak
+# query hints (ref_=nav_cart 1.0, checkout-in-query 0.8) stay advisory.
+_TRANSACTIONAL_DECISIVE = 2.0
+
+
+def _transactional_override(url_votes: Dict[str, float]) -> Optional[str]:
+    """The transactional subtype the URL *path* proves, if any.
+
+    A page under /cart/ or /checkouts/ IS a cart/checkout no matter how
+    PDP-ish its body looks: cart pages necessarily show prices and
+    add-to-cart/checkout phrases, so those markup signals must never outvote
+    the URL (the amazon ``/cart/add-to-cart/…`` page scored pdp 3.5 vs cart
+    2.5 from exactly that furniture and collapsed to 'unrelated')."""
+    cands = {s: w for s, w in url_votes.items()
+             if s in TRANSACTIONAL_SUBTYPES and w >= _TRANSACTIONAL_DECISIVE}
+    if not cands:
+        return None
+    return max(cands, key=cands.get)
+
+
+def is_transactional_url(url: str) -> bool:
+    """URL-only: does the path carry a decisive cart/checkout/order/wishlist
+    token? The pipeline uses this to suppress the *heuristic* product
+    extractor on such pages — a cart's prices are its line items and page
+    furniture, not evidence of a product-detail page."""
+    return _transactional_override(_url_subtype_votes(parse_url(url))) is not None
+
 
 _DECISIVE_ROLES = {"marketplace", "retailer", "brand", "search", "community",
                    "editorial", "reference"}
@@ -447,6 +475,13 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
                                                                 prior_cat))
 
     subtype = max(votes, key=votes.get)
+    # decisive transactional URL tokens win the subtype outright: prices and
+    # checkout buttons are *expected furniture* on a cart page, so the markup
+    # channel's pdp votes are not evidence against the URL's /cart/ path
+    override = _transactional_override(modality_votes["url"])
+    if override is not None and subtype != override:
+        subtype = override
+        signals.append("url_override")
     category = category_for_subtype(subtype)
     # collapse subtype votes into category-level scores for confidence
     cat_scores: Dict[str, float] = {}

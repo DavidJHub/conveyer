@@ -196,7 +196,7 @@ erDiagram
 | `seller_type` | string | `brand_owned · retailer · na` |
 | `funnel_stage` | string | Awareness … Post-Purchase / Irrelevant |
 | `classifier_method` | string | `rule · rule+prior · llm · error` |
-| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · base_content · prior · llm` |
+| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · base_content · directory · directory_content · prior · llm` — plus audit markers `url_override` (a decisive transactional URL token overrode the markup vote) and `url_validated` (label repaired by `python -m conveyer.scraping.validate`) |
 | `skincare_relevance` | float64 | 0–1 topical score (keywords + brands, in content **and** URL slugs) |
 | `is_study_relevant` | bool | `skincare_relevance ≥ 0.15`, or journey infrastructure (topic-neutral subtype on a known domain) |
 | `primary_brand` | string | page-intrinsic brand (brand domain or `product:brand`) |

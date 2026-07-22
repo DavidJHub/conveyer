@@ -457,6 +457,88 @@ def test_directory_external_file_extends_lists():
 
 
 # --------------------------------------------------------------------------- #
+# Transactional URLs must beat cart-furniture markup (the amazon add-to-cart
+# regression: fetched cart page scored pdp 3.5 vs cart 2.5 and collapsed to
+# 'unrelated' because a cart shows prices/checkout buttons by nature)
+# --------------------------------------------------------------------------- #
+AMAZON_CART_HTML = """<!doctype html><html lang="en-us"><head>
+<title>Amazon.com Shopping Cart</title></head>
+<body><h1>All Carts</h1><p>Your Amazon Cart is empty. Shop today's deals.
+Under $10. Beauty &amp; Personal Care. Electronics. Toys &amp; Games.
+Proceed to checkout. Check out Amazon Cart.</p>
+<a href="/checkout">Proceed to checkout</a><a href="/deals">Shop deals</a>
+</body></html>"""
+AMAZON_CART_URL = "https://www.amazon.com/cart/add-to-cart/ref=dp_start-bbf_1_glance"
+
+
+def test_transactional_url_beats_pdp_markup():
+    cfg = ScrapeConfig()
+    page = extract_page(AMAZON_CART_HTML, AMAZON_CART_URL)
+    _check(page.has_price and page.has_add_to_cart,
+           "the misleading cart furniture must be present for this test to bite")
+    # even with a phantom product counted, the URL's /cart/ path must win
+    r = classify_rule(page, AMAZON_CART_URL, cfg, n_products=1)
+    _check(r.page_subtype == "cart", f"subtype {r.page_subtype} (want cart)")
+    _check(r.page_category == "shopping", f"category {r.page_category}")
+    _check(r.funnel_stage == "Purchase", f"funnel {r.funnel_stage}")
+    _check(r.is_study_relevant, "a cart on a known retailer is journey infrastructure")
+    _check("url_override" in r.signals, f"override must be audited: {r.signals}")
+    # a real PDP with only a cart-ish QUERY hint must NOT be overridden
+    pdp_url = "https://www.amazon.com/dp/B00365FJ8K?ref_=nav_cart"
+    r2 = classify_rule(extract_page("", pdp_url), pdp_url, cfg)
+    _check(r2.page_subtype == "pdp", f"query hint must stay advisory: {r2.page_subtype}")
+
+
+def test_no_phantom_products_on_transactional_pages():
+    from conveyer.scraping.classify import is_transactional_url
+    _check(is_transactional_url(AMAZON_CART_URL), "cart path is transactional")
+    _check(not is_transactional_url("https://www.amazon.com/dp/B00365FJ8K"),
+           "pdp is not transactional")
+    page = extract_page(AMAZON_CART_HTML, AMAZON_CART_URL)
+    with_h = extract_products(page)
+    _check(len(with_h) == 1 and with_h[0].source == "heuristic",
+           f"the phantom exists without the guard: {[(p.name, p.source) for p in with_h]}")
+    _check(extract_products(page, include_heuristic=False) == [],
+           "no heuristic phantom on transactional pages")
+
+
+def test_validate_repairs_unrelated_cart():
+    """The URL-rule double check must flag and repair a stored
+    unrelated/pdp/Irrelevant row whose URL alone proves shopping/cart/Purchase."""
+    from conveyer.scraping.validate import apply_validation, validation_report, write_pages
+    out = tempfile.mkdtemp(prefix="conveyer_validate_")
+    try:
+        art = run_scrape(ScrapeConfig(synthetic_n_pages=20, out_dir=out, progress_every=0))
+        pages = art["pages"].copy()
+        _check(validation_report(pages).empty, "a fresh run must validate clean")
+        # corrupt one cart row the way the old classifier failed
+        mask = pages["page_subtype"] == "cart"
+        _check(mask.any(), "corpus has a cart page")
+        idx = pages.index[mask][0]
+        pages.loc[idx, ["page_category", "page_subtype", "funnel_stage",
+                        "is_study_relevant"]] = ["unrelated", "pdp", "Irrelevant", False]
+        rep = validation_report(pages)
+        _check(len(rep) == 1 and rep.iloc[0]["mismatch"] == "category",
+               f"corruption must be flagged: {rep.to_dict('records')}")
+        fixed, rep2 = apply_validation(pages)
+        row = fixed.loc[idx]
+        _check(row["page_category"] == "shopping" and row["page_subtype"] == "cart",
+               f"repaired to {row['page_category']}/{row['page_subtype']}")
+        _check(row["funnel_stage"] == "Purchase" and bool(row["is_study_relevant"]),
+               f"funnel {row['funnel_stage']}")
+        _check("url_validated" in list(row["classification_signals"]), "repair audited")
+        # repaired frame must round-trip through the pinned parquet schema
+        path = os.path.join(out, "repaired.parquet")
+        write_pages(fixed, path)
+        back = pd.read_parquet(path)
+        _check(len(back) == len(fixed) and
+               back.set_index("page_id").loc[row["page_id"], "page_subtype"] == "cart",
+               "parquet round-trip keeps the repair")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # Incremental persistence & resume
 # --------------------------------------------------------------------------- #
 def test_incremental_jsonl_and_resume():

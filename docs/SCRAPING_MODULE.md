@@ -81,7 +81,9 @@ filter the list here.
 
 **What it uses.** The **`requests`** library (the standard Python HTTP
 client) for downloads; **`concurrent.futures.ThreadPoolExecutor`** (standard
-library) to run 12 downloads in parallel; **`urllib.robotparser`** (standard
+library) to run 12 downloads in parallel — submitted through a **sliding
+window** (~2× workers in flight, completed futures dropped immediately) so
+fetched HTML never accumulates in RAM; **`urllib.robotparser`** (standard
 library) to *parse* robots.txt — but the file itself is fetched with a bounded
 timeout, because the stdlib reader can hang forever on a dead host. The cache
 is one JSON file per URL, named by a SHA-256 hash of the URL.
@@ -382,9 +384,12 @@ Typical symptoms:
   `respect_robots`.
 * **Everything `offline_miss`** → you're in offline mode without a corpus or
   cache; add `--online` or point at cached data.
-* **Machine slows down / dies mid-run (memory)** → shouldn't happen anymore:
-  memory is bounded by `checkpoint_every` rows (the buffer flushes to
-  `*_parts/` and clears). If RAM is still tight, lower `--checkpoint-every`.
+* **Machine slows down / dies mid-run (memory)** → shouldn't happen anymore.
+  Two past causes, both fixed and regression-tested: fetch results (each
+  holding up to 2MB of HTML) were retained for the whole run by the futures
+  list — now a sliding window keeps at most ~2× workers of them alive; and
+  row buffers/parquet rewrites grew with the run — now checkpoints flush to
+  `*_parts/` and clear. If RAM is still tight, lower `--checkpoint-every`.
   To read the raw HTML of any page, follow its `html_path` column into
   `outputs/scrape_cache/`.
 * **A page classified from its homepage** (`fetch_scope="base"`) → correct

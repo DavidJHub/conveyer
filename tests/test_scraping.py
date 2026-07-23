@@ -348,6 +348,62 @@ def test_throttle_is_per_domain_not_global():
     _check(time.monotonic() - t1 >= 0.4, "same domain must be rate-limited")
 
 
+def test_iter_fetch_does_not_retain_results():
+    """The fetch loop must not pin every page's HTML in RAM. The old
+    implementation submitted every URL upfront and kept the futures list
+    alive for the whole run — each completed Future retains its FetchResult
+    (html up to 2MB), so ~13k real pages = ~10-26GB and a dead machine. With
+    windowed submission, only ~a window of results may be alive at once."""
+    import gc
+    import weakref
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path == "/robots.txt":
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = ("<html><head><title>p</title></head><body>"
+                    + "x" * 50_000 + "</body></html>").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        cfg = ScrapeConfig(offline=False, rate_limit_per_domain=0.0, use_cache=False,
+                           timeout=5.0, hard_timeout=10.0, max_retries=0)
+        f = Fetcher(cfg)
+        n_urls = 150
+        wrefs, peak, n = [], 0, 0
+        for fr in f.iter_fetch([f"{base}/page/{i}" for i in range(n_urls)]):
+            _check(fr.ok, f"fetch failed: {fr.status} {fr.error}")
+            wrefs.append(weakref.ref(fr))
+            del fr
+            n += 1
+            alive = sum(1 for w in wrefs if w() is not None)
+            peak = max(peak, alive)
+        gc.collect()
+        alive_end = sum(1 for w in wrefs if w() is not None)
+        bound = 2 * (2 * cfg.max_workers) + cfg.max_workers   # window + refill slack
+        _check(n == n_urls, f"all urls fetched: {n}/{n_urls}")
+        _check(peak <= bound,
+               f"results must stay window-bounded, peak={peak} (bound {bound}, "
+               f"the old futures-list leak would peak at {n_urls})")
+        _check(alive_end <= 2 * cfg.max_workers,
+               f"results must be freed after the run, {alive_end}/{n_urls} alive")
+    finally:
+        srv.shutdown()
+
+
 def test_base_url_fallback():
     """An unreachable deep link on an unknown domain must fall back to the base
     page (scheme://host/) for content, classify from base content + original

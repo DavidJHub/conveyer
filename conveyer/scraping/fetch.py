@@ -284,19 +284,49 @@ class Fetcher:
     def iter_fetch(self, urls: List[str]) -> Iterator[FetchResult]:
         """Yield each URL's result **as soon as it completes** (unordered when
         online). This is what lets the pipeline persist line-by-line instead of
-        waiting for the whole batch."""
+        waiting for the whole batch.
+
+        Submission is a **sliding window** (~2× workers in flight) and every
+        completed Future is dropped immediately. This is load-bearing: a
+        completed ``Future`` retains its result forever, and each result's
+        ``.html`` is a full page body (up to ``max_bytes`` = 2MB). The old
+        implementation kept ALL futures in a list for the whole run, so the
+        raw HTML of every page ever fetched stayed pinned in RAM — ~10-26GB
+        by ~13k real pages, killing long runs at a consistent page count.
+        With the window, at most ~2× workers results exist at once (~50MB
+        worst case) no matter how many URLs the run covers."""
         if self.cfg.offline:
             for u in urls:
                 yield self._offline(u)
             return
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
         workers = max(1, min(self.cfg.max_workers, len(urls) or 1))
+        window = max(2 * workers, 1)
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(self._online, u) for u in urls]
-            for fut in as_completed(futures):
-                yield fut.result()
+            in_flight = set()
+            it = iter(urls)
+            try:
+                while True:
+                    while len(in_flight) < window:
+                        u = next(it, None)
+                        if u is None:
+                            break
+                        in_flight.add(ex.submit(self._online, u))
+                    if not in_flight:
+                        break
+                    done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                    while done:
+                        fut = done.pop()   # drop our reference before yielding:
+                        res = fut.result()  # after the caller moves on, nothing
+                        del fut             # holds this result — HTML is freed
+                        yield res
+                        del res
+            finally:
+                for fut in in_flight:   # generator closed early: drop the queue
+                    fut.cancel()
 
     def fetch_many(self, urls: List[str]) -> List[FetchResult]:
         """Batch convenience wrapper over :meth:`iter_fetch` (order not
-        guaranteed online; match results by ``FetchResult.url``)."""
+        guaranteed online; match results by ``FetchResult.url``). Holds every
+        result at once — small batches only; long runs use ``iter_fetch``."""
         return list(self.iter_fetch(urls))

@@ -565,6 +565,73 @@ def test_incremental_jsonl_and_resume():
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_checkpoint_parts_bounded_memory():
+    """Checkpoints must flush buffered rows to parquet part files (freeing
+    memory) and the final parquet must be streamed from those parts. A
+    pre-parts-format output (JSONL only) must migrate automatically."""
+    from conveyer.scraping.schema import part_files
+    out = tempfile.mkdtemp(prefix="conveyer_parts_")
+    try:
+        cfg = ScrapeConfig(synthetic_n_pages=12, out_dir=out, progress_every=0,
+                           checkpoint_every=5)
+        art = run_scrape(cfg)
+        parts = part_files(cfg.pages_parts_dir())
+        _check(len(parts) == 3, f"12 pages / checkpoint 5 -> 3 parts, got {len(parts)}")
+        _check(len(art["pages"]) == 12, "final parquet complete")
+        _check(art["pages"]["page_id"].nunique() == 12, "no duplicates")
+
+        # rerun: nothing pending, nothing duplicated, parts untouched
+        art2 = run_scrape(cfg)
+        _check(art2["n_new"] == 0, f"nothing to redo, n_new {art2['n_new']}")
+        _check(len(art2["pages"]) == 12 and art2["pages"]["page_id"].nunique() == 12,
+               "rerun keeps the table intact")
+        _check(len(part_files(cfg.pages_parts_dir())) == 3, "no empty/dup parts appended")
+
+        # old-format migration: JSONL exists but parts are gone
+        shutil.rmtree(cfg.pages_parts_dir())
+        shutil.rmtree(cfg.products_parts_dir(), ignore_errors=True)
+        art3 = run_scrape(cfg)
+        _check(art3["n_new"] == 0, "JSONL alone is enough to resume")
+        _check(len(art3["pages"]) == 12 and art3["pages"]["page_id"].nunique() == 12,
+               f"parts rebuilt from the JSONL commit log: {len(art3['pages'])}")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_offline_cache_is_lazy_and_html_path_recorded():
+    """Offline mode must serve previously fetched pages from the per-URL disk
+    cache (never preloading a corpus), and the page row must record where the
+    raw HTML lives (html_path)."""
+    from conveyer.scraping.fetch import FetchResult
+    from conveyer.scraping.fetch import _cache_path as cache_path_for
+    from conveyer.scraping.pipeline import _process_one
+    from conveyer.scraping.sources import ScrapeSources
+
+    tmp = tempfile.mkdtemp(prefix="conveyer_htmlcache_")
+    try:
+        cfg = ScrapeConfig(cache_dir=os.path.join(tmp, "cache"))
+        url = "https://cerave.com/products/moisturizing-cream"
+        # simulate a previous online run having cached the page
+        writer = Fetcher(cfg)
+        writer._write_cache(FetchResult(url=url, status="ok", http_status=200,
+                                        final_url=url, content_type="text/html",
+                                        html=PROD_HTML, fetched_at="t"))
+        # a fresh offline fetcher with NO corpus must find it on disk, lazily
+        reader = Fetcher(cfg, html_by_url={})
+        fr = reader.fetch(url)
+        _check(fr.ok and fr.from_cache, f"lazy disk-cache hit: {fr.status}")
+
+        src = ScrapeSources(urls=pd.DataFrame(), mentions={})
+        pr, prods = _process_one(cfg, src, {"url": url}, fr, reader)
+        _check(pr["html_path"] == cache_path_for(cfg, url),
+               f"html_path must point at the cache file: {pr['html_path']}")
+        _check(os.path.exists(pr["html_path"]), "the file actually exists")
+        _check(pr["page_category"] == "shopping" and len(prods) >= 1,
+               "cached page classifies and yields products as if fetched")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- #
 # Schema & pipeline
 # --------------------------------------------------------------------------- #

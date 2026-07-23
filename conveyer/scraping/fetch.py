@@ -95,6 +95,13 @@ class Fetcher:
                     html = v
                     break
         if html is None:
+            # lazily serve a previous online run's page from the disk cache —
+            # one file per URL, read on demand. (The pipeline used to preload
+            # EVERY cached page's HTML into one dict, which at 2MB/page killed
+            # machines on big replays.)
+            cached = self._read_cache(url)
+            if cached is not None and cached.html:
+                return cached
             return FetchResult(url=url, status="offline_miss", fetched_at=_now())
         return FetchResult(url=url, status="ok", http_status=200, final_url=url,
                            content_type="text/html", html=html, fetched_at=_now())

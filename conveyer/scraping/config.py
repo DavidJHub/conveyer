@@ -121,3 +121,11 @@ class ScrapeConfig:
 
     def products_jsonl_path(self) -> str:
         return self.products_path().rsplit(".", 1)[0] + ".jsonl"
+
+    # bounded-memory checkpoints: each checkpoint flushes the in-memory buffer
+    # as one parquet part file here; the final parquet is streamed from these
+    def pages_parts_dir(self) -> str:
+        return self.pages_path().rsplit(".", 1)[0] + "_parts"
+
+    def products_parts_dir(self) -> str:
+        return self.products_path().rsplit(".", 1)[0] + "_parts"

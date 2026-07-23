@@ -44,7 +44,7 @@ PAGE_SCHEMA = pa.schema([
     # fetch
     ("fetch_status", _S), ("http_status", _I32), ("content_type", _S),
     ("fetched_at", _S), ("fetch_error", _S), ("from_cache", _B),
-    ("fetch_scope", _S), ("parser", _S),
+    ("fetch_scope", _S), ("parser", _S), ("html_path", _S),
     # extracted page info
     ("lang", _S), ("title", _S), ("meta_description", _S), ("h1", _S),
     ("canonical_url", _S), ("og_type", _S), ("og_site_name", _S),
@@ -103,7 +103,8 @@ def _as_int(x) -> Optional[int]:
 # Row assembly
 # --------------------------------------------------------------------------- #
 def page_row(url_row: dict, fetch: FetchResult, content: PageContent,
-             cls: PageClass, n_products: int, fetch_scope: str = "page") -> dict:
+             cls: PageClass, n_products: int, fetch_scope: str = "page",
+             html_path: str = "") -> dict:
     url = url_row.get("url") or fetch.url
     u = parse_url(url)
     return {
@@ -123,6 +124,7 @@ def page_row(url_row: dict, fetch: FetchResult, content: PageContent,
         "from_cache": bool(fetch.from_cache),
         "fetch_scope": fetch_scope,
         "parser": content.parser,
+        "html_path": html_path,
         "lang": content.lang,
         "title": content.title,
         "meta_description": content.meta_description,
@@ -233,3 +235,75 @@ def build_frames(page_rows: List[dict], product_rows_: List[dict]
                  ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return (to_dataframe(page_rows, PAGE_SCHEMA),
             to_dataframe(product_rows_, PRODUCT_SCHEMA))
+
+
+# --------------------------------------------------------------------------- #
+# Bounded-memory persistence: parquet part files + streaming finalize
+# --------------------------------------------------------------------------- #
+# The pipeline never holds more than one checkpoint's worth of rows in memory:
+# each checkpoint writes the buffered rows as `part-NNNNNN.parquet` in a parts
+# directory and clears the buffer. The final single-file parquet is assembled
+# at the end by STREAMING the parts through a ParquetWriter — one small part
+# in memory at a time, never the whole table.
+def part_files(parts_dir: str) -> List[str]:
+    import glob
+    import os
+    if not os.path.isdir(parts_dir):
+        return []
+    return sorted(glob.glob(os.path.join(parts_dir, "part-*.parquet")))
+
+
+def next_part_seq(parts_dir: str) -> int:
+    import os
+    files = part_files(parts_dir)
+    if not files:
+        return 0
+    last = os.path.basename(files[-1])           # part-000123.parquet
+    try:
+        return int(last.split("-")[1].split(".")[0]) + 1
+    except (IndexError, ValueError):
+        return len(files)
+
+
+def write_part(rows: List[dict], schema: pa.Schema, parts_dir: str, seq: int) -> int:
+    """Write ``rows`` as one part file and return the next sequence number.
+    Empty buffers write nothing (and keep the sequence unchanged)."""
+    import os
+    if not rows:
+        return seq
+    os.makedirs(parts_dir, exist_ok=True)
+    path = os.path.join(parts_dir, f"part-{seq:06d}.parquet")
+    pq.write_table(to_arrow_table(rows, schema), path)
+    return seq + 1
+
+
+def part_column_values(parts_dir: str, column: str) -> set:
+    """All values of one column across the part files (columnar read — cheap)."""
+    out: set = set()
+    for f in part_files(parts_dir):
+        try:
+            out |= set(pq.read_table(f, columns=[column]).column(column).to_pylist())
+        except Exception:
+            continue
+    return out
+
+
+def finalize_from_parts(parts_dir: str, schema: pa.Schema, final_path: str) -> int:
+    """Stream every part file into one final parquet (atomic replace).
+    Returns the row count. Memory use is bounded by the largest single part."""
+    import os
+    os.makedirs(os.path.dirname(os.path.abspath(final_path)) or ".", exist_ok=True)
+    tmp = final_path + ".tmp"
+    n = 0
+    writer = pq.ParquetWriter(tmp, schema)
+    try:
+        for f in part_files(parts_dir):
+            t = pq.read_table(f)
+            if t.schema != schema:               # tolerate older parts: realign
+                t = to_arrow_table(t.to_pylist(), schema)
+            writer.write_table(t)
+            n += t.num_rows
+    finally:
+        writer.close()
+    os.replace(tmp, final_path)
+    return n

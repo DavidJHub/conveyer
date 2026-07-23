@@ -283,25 +283,41 @@ round-trip):
   metadata, extracted info, classification, provenance, dwell).
 * `scraped_products.parquet` — one row per product, FK `page_id`.
 
-The write strategy makes long runs safe:
+The write strategy makes long runs safe **and keeps memory flat** no matter
+how many pages the run covers:
 
 * the moment a page finishes, its rows are **appended to `.jsonl` sidecars**
   (products first, then the page line as the *commit marker* — so a crash
   between the two writes can't leave orphan products);
-* parquet files are refreshed every `checkpoint_every = 500` pages **and on
-  exit, including Ctrl-C**;
-* with `resume=True` (default), a re-run reads the sidecar and **skips URLs
-  already done** — you can kill and restart a 265k-URL run freely.
+* every `checkpoint_every = 500` pages, the in-memory buffer is **flushed to
+  a parquet part file** (`scraped_pages_parts/part-000042.parquet`) and
+  **cleared** — RAM holds at most one checkpoint's worth of rows. Mid-run
+  progress is directly queryable:
+  `pd.read_parquet("outputs/scrape/scraped_pages_parts")`;
+* on exit **including Ctrl-C**, the parts are **streamed** one at a time into
+  the final single-file parquet — the full table is never materialized in
+  memory;
+* with `resume=True` (default), a re-run reads only the *done-URL set* from
+  the sidecar (not the rows) and **skips URLs already done**; rows that a
+  hard crash left in the JSONL but not yet in a part are recovered into parts
+  in bounded chunks. Outputs from before the parts format migrate
+  automatically;
+* the **raw HTML of every fetched page is on disk**, one file per URL, in
+  `outputs/scrape_cache/` — the page row's **`html_path`** column points at
+  it, so any page can be re-inspected or re-classified without re-fetching.
+  Offline replays read these files lazily, never preloading them into RAM.
 
-**What it uses.** **pyarrow** for parquet, plain file-append for JSONL,
-standard **`json`** for the lines. Results stream in "as completed" from the
-thread pool, so there is no batch barrier — one slow site never blocks the
-rest.
+**What it uses.** **pyarrow** for parquet (`ParquetWriter` for the streaming
+concat), plain file-append for JSONL, standard **`json`** for the lines.
+Results stream in "as completed" from the thread pool, so there is no batch
+barrier — one slow site never blocks the rest.
 
 **In plain terms.** A ship's logbook (JSONL) written line by line as events
-happen, plus a fair-copy report (parquet) retyped every 500 entries. If the
-ship sinks mid-sentence, you lose at most that one line, and the next voyage
-starts where the log ends.
+happen; every 500 entries the pages on the desk are filed into a numbered
+folder (part file) and the desk is swept clean; at the end the folders are
+bound into one book (final parquet), one folder at a time. If the ship sinks
+mid-sentence you lose at most that one line, and the next voyage starts where
+the log ends — the desk never gets fuller than 500 pages.
 
 ### Step 8 — Self-evaluation (`pipeline.py::evaluate` + `synthetic.py`)
 
@@ -366,6 +382,11 @@ Typical symptoms:
   `respect_robots`.
 * **Everything `offline_miss`** → you're in offline mode without a corpus or
   cache; add `--online` or point at cached data.
+* **Machine slows down / dies mid-run (memory)** → shouldn't happen anymore:
+  memory is bounded by `checkpoint_every` rows (the buffer flushes to
+  `*_parts/` and clears). If RAM is still tight, lower `--checkpoint-every`.
+  To read the raw HTML of any page, follow its `html_path` column into
+  `outputs/scrape_cache/`.
 * **A page classified from its homepage** (`fetch_scope="base"`) → correct
   behaviour for blocked deep links; products deliberately absent.
 * **Weird `coincides`** → inspect `match_type` / `match_score` on the product

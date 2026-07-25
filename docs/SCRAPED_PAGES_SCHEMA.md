@@ -168,7 +168,7 @@ erDiagram
 
 | column | type | description |
 |---|---|---|
-| `fetch_status` | string | `ok · cached · error · skipped · offline_miss · robots_blocked` |
+| `fetch_status` | string | `ok · cached · error · skipped · offline_miss · robots_blocked · circuit_open` |
 | `http_status` | int32 (nullable) | HTTP code (null when never fetched) |
 | `content_type` | string | response content-type |
 | `fetched_at` | string | UTC ISO timestamp |
@@ -202,7 +202,7 @@ erDiagram
 | `seller_type` | string | `brand_owned · retailer · na` |
 | `funnel_stage` | string | Awareness … Post-Purchase / Irrelevant |
 | `classifier_method` | string | `rule · rule+prior · llm · error` |
-| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · base_content · directory · directory_content · prior · llm` — plus audit markers `url_override` (a decisive transactional URL token overrode the markup vote) and `url_validated` (label repaired by `python -m conveyer.scraping.validate`) |
+| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · base_content · domain_profile · prior · llm` |
 | `skincare_relevance` | float64 | 0–1 topical score (keywords + brands, in content **and** URL slugs) |
 | `is_study_relevant` | bool | `skincare_relevance ≥ 0.15`, or journey infrastructure (topic-neutral subtype on a known domain) |
 | `primary_brand` | string | page-intrinsic brand (brand domain or `product:brand`) |
@@ -273,7 +273,20 @@ erDiagram
    certifies the plumbing and rules, **not** real-world accuracy; on real pages
    expect degradation from JS-rendered content (no headless browser), bot
    walls, and unmarked-up products.
-3. **Offline by default; online mode cannot hang.** Nothing touches the
+3. **Domains are never re-worked.** Three reuse layers keep long runs fast
+   without ever copying a *page-level* label across a domain (an amazon cart
+   is not an amazon PDP): (a) a **circuit breaker** — after
+   `domain_failure_threshold` straight failures a domain's remaining fetches
+   are skipped instantly (`fetch_status="circuit_open"`); (b) the **smart
+   fetch policy** (default online) — URL-decided pages (cart/checkout/order/
+   wishlist/SERP) are never fetched, and content fetches are capped at
+   `max_fetch_per_domain` per domain; (c) **learned domain profiles** —
+   topical relevance + seller type accumulated from the pages that *were*
+   fetched (persisted to `domain_profiles.json`, reused across runs) classify
+   the remaining URLs of the domain network-free
+   (`classification_signals` shows `domain_profile`). Fetched pages are
+   processed first so profiles exist before the deferred URLs classify.
+4. **Offline by default; online mode cannot hang.** Nothing touches the
    network unless `ScrapeConfig(offline=False)` / `--online`. Online, every
    URL runs under a **wall-clock budget** (`hard_timeout`, default 30s)
    covering robots.txt (fetched with a bounded timeout — the stdlib reader
@@ -281,20 +294,20 @@ erDiagram
    a socket `timeout` alone cannot stop. The per-domain rate limiter reserves
    a slot and sleeps *outside* the lock, so one slow domain never stalls the
    other workers. Everything is cached under `outputs/scrape_cache/`.
-4. **Incremental by construction.** Results stream in completion order into
+5. **Incremental by construction.** Results stream in completion order into
    the `.jsonl` sidecars (one line per record; the page line is the commit
    marker), with `[progress]` lines reporting throughput/ETA; parquet is a
    periodic snapshot. Interrupt at any time; the next run resumes.
-5. **Input-file-only mode.** With just `simweb_input_file.parquet`, URLs and
+6. **Input-file-only mode.** With just `simweb_input_file.parquet`, URLs and
    dwell come from `next_10_urls`/`a_links_source`/`ai_click`; there is no
    vendor prior (`prior_* = ""`) and no entity table, so product↔chat matching
    reports `match_type = "none"` until `fact_ai_recommendation` +
    `fact_ai_concept` are added.
-6. **Dwell is attention's upper bound.** The gap includes idle/tab-away time;
+7. **Dwell is attention's upper bound.** The gap includes idle/tab-away time;
    the last trail entry never gets a dwell (no successor to measure against).
-7. **The vendor prior is a prior, not truth.** `prior_page_type` disagrees with
+8. **The vendor prior is a prior, not truth.** `prior_page_type` disagrees with
    the classifier on genuinely ambiguous pages; both are kept so the
    disagreement is auditable (`classifier_method` tells you when the prior was
    blended in).
-8. **String `"None"` normalisation** from `dim_digital_site` is applied when
+9. **String `"None"` normalisation** from `dim_digital_site` is applied when
    building the candidate table (prior columns arrive clean or `""`).

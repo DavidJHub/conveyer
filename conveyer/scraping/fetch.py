@@ -38,7 +38,8 @@ from .config import ScrapeConfig
 @dataclass
 class FetchResult:
     url: str
-    status: str = "error"          # ok | cached | error | skipped | offline_miss | robots_blocked
+    status: str = "error"          # ok | cached | error | skipped | offline_miss |
+                                   # robots_blocked | circuit_open
     http_status: Optional[int] = None
     final_url: str = ""
     content_type: str = ""
@@ -83,7 +84,28 @@ class Fetcher:
         self._session = None
         self._robots: Dict[str, Optional[robotparser.RobotFileParser]] = {}
         self._last_hit: Dict[str, float] = {}
+        # circuit breaker: {domain: [consecutive_failures, successes]}. A domain
+        # that only ever fails stops being fetched after the threshold — dead or
+        # bot-walled hosts must not cost hard_timeout for every one of their URLs.
+        self._domain_state: Dict[str, list] = {}
         self._lock = threading.Lock()
+
+    # -- circuit breaker ---------------------------------------------------- #
+    def _circuit_open(self, domain: str) -> bool:
+        thr = getattr(self.cfg, "domain_failure_threshold", 0)
+        if thr <= 0:
+            return False
+        with self._lock:
+            fails, oks = self._domain_state.get(domain, [0, 0])
+        return oks == 0 and fails >= thr
+
+    def _record_outcome(self, domain: str, ok: bool) -> None:
+        with self._lock:
+            state = self._domain_state.setdefault(domain, [0, 0])
+            if ok:
+                state[0], state[1] = 0, state[1] + 1
+            else:
+                state[0] += 1
 
     # -- offline ----------------------------------------------------------- #
     def _offline(self, url: str) -> FetchResult:
@@ -209,6 +231,12 @@ class Fetcher:
         u = parse_url(url)
         if not u.host:
             return FetchResult(url=url, status="error", error="unparseable url", fetched_at=_now())
+        domain = u.registrable or u.host
+        if self._circuit_open(domain):
+            return FetchResult(url=url, status="circuit_open",
+                               error=f"domain circuit open "
+                                     f"({self._domain_state[domain][0]} straight failures)",
+                               fetched_at=_now())
         try:
             self._ensure_session()
         except ImportError:
@@ -222,6 +250,7 @@ class Fetcher:
         deadline = time.monotonic() + self.cfg.hard_timeout
 
         if not self._robots_ok(url, u):
+            self._record_outcome(domain, ok=True)   # host answered; only blocked
             return FetchResult(url=url, status="robots_blocked", final_url=url, fetched_at=_now())
 
         backoff = self.cfg.retry_backoff
@@ -239,6 +268,7 @@ class Fetcher:
                 ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
                 if ctype and not any(ctype == a for a in self.cfg.allowed_content_types):
                     resp.close()
+                    self._record_outcome(domain, ok=True)
                     return FetchResult(url=url, status="skipped", http_status=resp.status_code,
                                        final_url=str(resp.url), content_type=ctype,
                                        error="non-html content-type", fetched_at=_now())
@@ -266,6 +296,7 @@ class Fetcher:
                 resp.close()
                 if res.ok:
                     self._write_cache(res)
+                    self._record_outcome(domain, ok=True)
                     return res
                 last_err = res.error
             except Exception as exc:  # network / timeout
@@ -273,6 +304,7 @@ class Fetcher:
             if attempt < self.cfg.max_retries and time.monotonic() < deadline:
                 time.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
                 backoff *= 2
+        self._record_outcome(domain, ok=False)
         return FetchResult(url=url, status="error", error=last_err, fetched_at=_now())
 
     # -- public ------------------------------------------------------------ #

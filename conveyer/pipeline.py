@@ -91,11 +91,20 @@ def _parse_args(argv=None):
     p.add_argument("--conversion-stage", default="cart",
                    choices=["shopping", "cart", "checkout"])
     p.add_argument("--sessions", type=int, default=40, help="synthetic session count")
+    p.add_argument("--dashboard", action="store_true",
+                   help="also render outputs/dashboard.html from this run")
     a = p.parse_args(argv)
-    return (ConversationConfig(data_path=a.data, synthetic_n_sessions=a.sessions),
+    cfgs = (ConversationConfig(data_path=a.data, synthetic_n_sessions=a.sessions),
             ScrapeConfig(offline=not a.online, max_urls=a.max_urls),
             JourneyConfig(conversion_stage=a.conversion_stage))
+    return cfgs, a.dashboard
 
 
 if __name__ == "__main__":
-    run_pipeline(*_parse_args())
+    _cfgs, _dash = _parse_args()
+    _art = run_pipeline(*_cfgs)
+    if _dash:
+        from .dashboard import DashboardConfig, build_dashboard, from_pipeline_art
+
+        build_dashboard(from_pipeline_art(_art),
+                        DashboardConfig(conversion_stage=_cfgs[2].conversion_stage))

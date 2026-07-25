@@ -140,6 +140,12 @@ Why it cannot run forever or lose work, by construction:
 * results are processed **as they complete** (`as_completed`), not as a batch:
   the first page lands in the JSONL within seconds and `[progress]` lines
   report throughput and ETA;
+* **domains are never re-worked**: a circuit breaker skips domains that only
+  fail; the smart fetch policy (default online) never fetches URL-decided
+  pages (carts, checkouts, SERPs) and caps content fetches per domain; the
+  pages that were fetched teach a **domain profile** (relevance + seller,
+  persisted to `domain_profiles.json`) that classifies the domain's remaining
+  URLs network-free — page-level labels are never domain-copied;
 * products are written first and the page line last (a **commit marker**), so a
   crash or Ctrl-C loses at most the single page in flight — and the next run
   **resumes**, redoing only what's missing.
@@ -365,6 +371,8 @@ Key `ScrapeConfig` knobs:
 | `resume` / `checkpoint_every` / `progress_every` | `True` / 500 / 25 | line-by-line JSONL + parquet snapshots + progress/ETA lines |
 | `use_cache` / `cache_dir` | `True` | every fetch cached; re-runs are free |
 | `max_urls`, `only_recommended`, `dedupe_by` | all / off / url | scope control for the 265k-URL universe |
+| `fetch_policy` / `max_fetch_per_domain` | `smart` / 25 | online only: skip URL-decided pages, cap content fetches per domain, classify the rest via the learned domain profile |
+| `domain_failure_threshold` | 3 | straight failures before a domain's circuit opens and its fetches are skipped |
 | `classifier` | `auto` | rule scorer; refines low-confidence pages with an LLM when `ANTHROPIC_API_KEY` is set |
 | `coincide_threshold` | 0.5 | match score needed to declare product coincidence |
 

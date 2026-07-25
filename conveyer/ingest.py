@@ -196,13 +196,21 @@ _ARCHETYPES = [
     ("researcher", 0.10),          # reads reviews/reference, no shopping
 ]
 
-_QUESTION_TEMPLATES = [
-    "what should i use for {concern}?",
-    "best {ptype} for {concern}?",
-    "is {brand} good for {concern}?",
-    "can you recommend a {ptype} for {concern}",
-    "how do i fix {concern}",
-]
+# stage-aware question templates so synthetic journeys traverse the funnel
+# (Awareness → Discovery → Evaluation → Intent) instead of flat-lining
+_Q_BY_POSITION = {
+    "open": ["what is {ptype} and how does it work?",
+             "why do i have {concern}?",
+             "what should i use for {concern}?",
+             "best {ptype} for {concern}?"],
+    "mid": ["is {brand} {product} worth it for {concern}?",
+            "{brand} vs {alt} — which is better for {concern}?",
+            "reviews of {brand} {product}?"],
+    "close": ["where can i buy it?",
+              "how much is it and is it in stock?",
+              "cheapest place to get it?",
+              "where can i buy {brand} {product}?"],
+}
 _CONCERNS = ["dry skin", "acne", "dark spots", "redness", "oily skin", "fine lines"]
 
 
@@ -289,8 +297,11 @@ def make_synthetic_conversations(n_sessions: int = 40, seed: int = 42,
         t0 = base_ms + s * 3_600_000
         for turn in range(n_turns):
             mid = f"{sid}m{turn}"
-            q = _QUESTION_TEMPLATES[int(rng.integers(len(_QUESTION_TEMPLATES)))] \
-                .format(concern=concern, ptype=ptype, brand=brand)
+            slot = "open" if turn == 0 else ("close" if turn == n_turns - 1 else "mid")
+            pool = _Q_BY_POSITION[slot]
+            q = pool[int(rng.integers(len(pool)))].format(
+                concern=concern, ptype=ptype, brand=brand, product=product,
+                alt=alt[0])
             if turn < n_turns - 1:
                 a = (f"For {concern}, a good {ptype} is {brand} {product} — gentle and "
                      f"well reviewed ({rating}/5).")

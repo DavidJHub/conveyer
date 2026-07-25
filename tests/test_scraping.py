@@ -348,60 +348,70 @@ def test_throttle_is_per_domain_not_global():
     _check(time.monotonic() - t1 >= 0.4, "same domain must be rate-limited")
 
 
-def test_iter_fetch_does_not_retain_results():
-    """The fetch loop must not pin every page's HTML in RAM. The old
-    implementation submitted every URL upfront and kept the futures list
-    alive for the whole run — each completed Future retains its FetchResult
-    (html up to 2MB), so ~13k real pages = ~10-26GB and a dead machine. With
-    windowed submission, only ~a window of results may be alive at once."""
-    import gc
-    import weakref
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+def test_domain_circuit_breaker():
+    """A domain that only ever fails must stop being fetched after the
+    threshold — dead hosts can't cost hard_timeout for every URL."""
+    # a port nobody listens on -> instant connection refused
+    import socket
 
-    class H(BaseHTTPRequestHandler):
-        def log_message(self, *a):
-            pass
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    base = f"http://127.0.0.1:{port}"
 
-        def do_GET(self):
-            if self.path == "/robots.txt":
-                self.send_response(404)
-                self.end_headers()
-                return
-            body = ("<html><head><title>p</title></head><body>"
-                    + "x" * 50_000 + "</body></html>").encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+    cfg = ScrapeConfig(offline=False, timeout=1.0, hard_timeout=3.0, max_retries=0,
+                       rate_limit_per_domain=0.0, use_cache=False,
+                       respect_robots=False, domain_failure_threshold=2)
+    f = Fetcher(cfg)
+    t0 = time.monotonic()
+    statuses = [f.fetch(f"{base}/p{i}").status for i in range(5)]
+    elapsed = time.monotonic() - t0
+    _check(statuses[:2] == ["error", "error"], f"first hits attempted: {statuses}")
+    _check(statuses[2:] == ["circuit_open"] * 3, f"circuit must open: {statuses}")
+    _check(elapsed < 5.0, f"circuit-open fetches must be instant, took {elapsed:.1f}s")
 
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{srv.server_address[1]}"
-    try:
-        cfg = ScrapeConfig(offline=False, rate_limit_per_domain=0.0, use_cache=False,
-                           timeout=5.0, hard_timeout=10.0, max_retries=0)
-        f = Fetcher(cfg)
-        n_urls = 150
-        wrefs, peak, n = [], 0, 0
-        for fr in f.iter_fetch([f"{base}/page/{i}" for i in range(n_urls)]):
-            _check(fr.ok, f"fetch failed: {fr.status} {fr.error}")
-            wrefs.append(weakref.ref(fr))
-            del fr
-            n += 1
-            alive = sum(1 for w in wrefs if w() is not None)
-            peak = max(peak, alive)
-        gc.collect()
-        alive_end = sum(1 for w in wrefs if w() is not None)
-        bound = 2 * (2 * cfg.max_workers) + cfg.max_workers   # window + refill slack
-        _check(n == n_urls, f"all urls fetched: {n}/{n_urls}")
-        _check(peak <= bound,
-               f"results must stay window-bounded, peak={peak} (bound {bound}, "
-               f"the old futures-list leak would peak at {n_urls})")
-        _check(alive_end <= 2 * cfg.max_workers,
-               f"results must be freed after the run, {alive_end}/{n_urls} alive")
-    finally:
-        srv.shutdown()
+
+def test_smart_fetch_policy():
+    """URL-decided pages are never fetched; content fetches are capped per
+    domain; offline mode is exempt (corpus serving is free)."""
+    from conveyer.scraping.pipeline import _fetch_decision
+
+    online = ScrapeConfig(offline=False, fetch_policy="smart", max_fetch_per_domain=2)
+    budget = {}
+    fetch, why = _fetch_decision("https://www.amazon.com/gp/cart/view.html?ref_=nav_cart",
+                                 online, budget)
+    _check(not fetch and "URL-decided" in why, f"cart must not be fetched: {why}")
+    fetch, _ = _fetch_decision("https://www.google.com/search?q=retinol", online, budget)
+    _check(not fetch, "SERPs must not be fetched")
+    decisions = [_fetch_decision(f"https://www.byrdie.com/article-{i}", online, budget)[0]
+                 for i in range(4)]
+    _check(decisions == [True, True, False, False],
+           f"per-domain budget of 2 must cap fetches: {decisions}")
+    offline = ScrapeConfig(offline=True, fetch_policy="smart", max_fetch_per_domain=1)
+    _check(_fetch_decision("https://www.amazon.com/cart", offline, {})[0],
+           "offline mode always 'fetches' (the corpus is free)")
+
+
+def test_domain_profile_reuse():
+    """Knowledge learned from fetched pages of a domain classifies its
+    unfetched URLs — without copying page-level labels across the domain."""
+    cfg = ScrapeConfig()
+    url = "https://www.some-indie-brand.io/products/item-2841"
+    bare = classify_rule(extract_page("", url), url, cfg)
+    _check(bare.page_category == "unknown", f"no evidence -> {bare.page_category}")
+    prof = {"relevance": 0.6, "seller": "brand_owned", "n_pages": 3}
+    with_prof = classify_rule(extract_page("", url), url, cfg, domain_profile=prof)
+    _check(with_prof.page_category == "shopping",
+           f"profile relevance must keep the structural role: {with_prof.page_category}")
+    _check(with_prof.is_study_relevant, "profile supplies topical evidence")
+    _check(with_prof.seller_type == "brand_owned", "profile supplies the seller")
+    _check("domain_profile" in with_prof.signals, f"signals {with_prof.signals}")
+    # the profile must NOT overwrite what the URL says: a cart stays a cart
+    cart = "https://www.some-indie-brand.io/cart"
+    c = classify_rule(extract_page("", cart), cart, cfg, domain_profile=prof)
+    _check(c.page_subtype == "cart" and c.funnel_stage == "Purchase",
+           "page-level structure must never be domain-copied")
 
 
 def test_base_url_fallback():

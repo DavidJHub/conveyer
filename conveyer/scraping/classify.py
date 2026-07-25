@@ -422,13 +422,12 @@ def _softmax_conf(scores: Dict[str, float]) -> float:
 def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
                   prior: Optional[dict] = None, n_products: int = 0,
                   chat_brands: Optional[set] = None,
-                  content_scope: str = "page",
-                  directory_entry: "Optional[DomainEntry]" = None) -> PageClass:
-    """``content_scope`` says where ``page``'s content came from: ``"page"``
-    (the URL itself), ``"base"`` (its homepage standing in) or ``"directory"``
-    (the domain directory's description standing in). Stand-in content informs
-    relevance and votes but is never enough to *prove* a page unrelated — that
-    judgement requires the page's own content."""
+                  domain_profile: Optional[dict] = None) -> PageClass:
+    """``domain_profile`` is knowledge *learned from other pages of the same
+    domain* ({"relevance": 0..1, "seller": ...}): it floors topical relevance
+    and fills a missing seller_type, so URLs skipped by the fetch policy (or
+    unreachable) still classify from what the domain already taught us —
+    without ever copying a page-level label across the domain."""
     chat_brands = chat_brands or set()
     u = parse_url(url or page.url)
     prior = prior or {}
@@ -489,8 +488,15 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
         cat_scores[category_for_subtype(sub)] = cat_scores.get(category_for_subtype(sub), 0.0) + w
     confidence = _softmax_conf(cat_scores)
 
-    relevance = _skincare_relevance(page, u, chat_brands, prior_cat)
-    known = _known_domain(u, directory_entry)
+    relevance = _skincare_relevance(page, u, chat_brands,
+                                    str(prior.get(cfg.col_site_category, "")))
+    profile_used = False
+    if domain_profile:
+        prof_rel = float(domain_profile.get("relevance", 0.0) or 0.0)
+        if prof_rel > relevance:
+            relevance, profile_used = round(prof_rel, 3), True
+    known = _known_domain(u) or (domain_profile is not None
+                                 and float(domain_profile.get("relevance", 0) or 0) >= 0.15)
     # the winning subtype must be *earned* by structural evidence: a URL/markup
     # vote, a matching vendor prior, or a decisive domain/directory role
     # (>= 2.0 — search engine, community, editorial, reference, storefront
@@ -521,6 +527,9 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
             seller = "retailer"
         elif str(prior.get(cfg.col_seller_type, "")).lower() in ("1p", "3p"):
             seller = "retailer"
+        elif domain_profile and domain_profile.get("seller") in ("brand_owned", "retailer"):
+            seller = domain_profile["seller"]
+            profile_used = True
 
     # topical relevance overrides the headline bucket (user's "unrelated" case).
     # "unrelated" is a *confident* judgement — it needs the page's OWN content
@@ -554,6 +563,8 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     brands = sorted({b for b in chat_brands} | ({page_brand} if page_brand else set()))
     brands = [b for b in brands if b]
 
+    if profile_used:
+        signals.append("domain_profile")
     method = "rule+prior" if prior_fired else "rule"
     return PageClass(
         page_category=final_category, page_subtype=subtype, seller_type=seller,
@@ -629,12 +640,10 @@ def classify_llm(page: PageContent, url: str, cfg: ScrapeConfig,
 def classify_page(page: PageContent, url: str, cfg: ScrapeConfig,
                   prior: Optional[dict] = None, n_products: int = 0,
                   chat_brands: Optional[set] = None,
-                  content_scope: str = "page",
-                  directory_entry: "Optional[DomainEntry]" = None) -> PageClass:
+                  domain_profile: Optional[dict] = None) -> PageClass:
     """Full classification with the configured strategy and graceful fallback."""
     result = classify_rule(page, url, cfg, prior=prior, n_products=n_products,
-                           chat_brands=chat_brands, content_scope=content_scope,
-                           directory_entry=directory_entry)
+                           chat_brands=chat_brands, domain_profile=domain_profile)
     want_llm = cfg.classifier == "llm" or (cfg.classifier == "auto"
                                            and result.confidence < 0.55 and _llm_available(cfg))
     if want_llm and _llm_available(cfg):

@@ -50,7 +50,8 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from .classify import PageClass, classify_page, parse_url
+from .classify import (PageClass, classify_page, is_transactional_url,
+                       parse_url)
 from .config import ScrapeConfig
 from .directory import directory_content, lookup
 from .extract import PageContent, extract_page
@@ -297,7 +298,8 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
             profile = profiles.get(parse_url(url).registrable)
         cls = classify_page(content, url, cfg, prior=_prior_for(cfg, row_d),
                             n_products=len(products), chat_brands=chat_brands,
-                            domain_profile=profile)
+                            domain_profile=profile, directory_entry=entry,
+                            content_scope=scope)
         if scope == "base":
             cls.signals = [s for s in cls.signals if s != "content"] + ["base_content"]
         elif scope == "directory":
@@ -388,6 +390,20 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
     t_start = time.monotonic()
     pages_fh = open(cfg.pages_jsonl_path(), "a", encoding="utf-8")
     products_fh = open(cfg.products_jsonl_path(), "a", encoding="utf-8")
+    # bounded-memory buffers: flushed to parquet part files every checkpoint
+    # and cleared — RAM never holds more than one checkpoint's worth of rows
+    page_buf: List[dict] = []
+    prod_buf: List[dict] = []
+    pages_seq = next_part_seq(cfg.pages_parts_dir())
+    prods_seq = next_part_seq(cfg.products_parts_dir())
+
+    def flush_parts() -> None:
+        nonlocal page_buf, prod_buf, pages_seq, prods_seq
+        prods_seq = write_part(prod_buf, PRODUCT_SCHEMA, cfg.products_parts_dir(), prods_seq)
+        prod_buf = []
+        pages_seq = write_part(page_buf, PAGE_SCHEMA, cfg.pages_parts_dir(), pages_seq)
+        page_buf = []
+        _save_profiles(cfg, profiles)
 
     def handle(fr: FetchResult, allow_base: bool = True) -> None:
         nonlocal n_new, n_ok, n_err, n_circuit
@@ -403,8 +419,8 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
         pages_fh.write(json.dumps(pr, ensure_ascii=False, default=str) + "\n")
         pages_fh.flush()
 
-        page_rows_all.append(pr)
-        product_rows_all.extend(prods)
+        page_buf.append(pr)
+        prod_buf.extend(prods)
         n_new += 1
         n_ok += int(fr.ok)
         n_err += int(not fr.ok and fr.status not in ("skipped", "circuit_open"))
@@ -418,10 +434,8 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
                   f"circuit={n_circuit} | {rate:.1f} pages/s | eta {eta/60:.1f} min",
                   flush=True)
         if cfg.checkpoint_every and n_new % cfg.checkpoint_every == 0:
-            write_parquet(page_rows_all, PAGE_SCHEMA, cfg.pages_path())
-            write_parquet(product_rows_all, PRODUCT_SCHEMA, cfg.products_path())
-            _save_profiles(cfg, profiles)
-            print(f"[checkpoint] parquet refreshed at {len(page_rows_all)} pages", flush=True)
+            flush_parts()
+            print(f"[checkpoint] parts flushed at {n_done + n_new} pages total", flush=True)
 
     try:
         # fetched pages first — they build the domain profiles ...
@@ -434,12 +448,14 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
     finally:
         pages_fh.close()
         products_fh.close()
-        # snapshot whatever we have — also on crash/interrupt
-        write_parquet(page_rows_all, PAGE_SCHEMA, cfg.pages_path())
-        write_parquet(product_rows_all, PRODUCT_SCHEMA, cfg.products_path())
-        _save_profiles(cfg, profiles)
+        # flush the residual buffers and stream every part into the final
+        # single-file parquet — also on crash/interrupt
+        flush_parts()
+        finalize_from_parts(cfg.pages_parts_dir(), PAGE_SCHEMA, cfg.pages_path())
+        finalize_from_parts(cfg.products_parts_dir(), PRODUCT_SCHEMA, cfg.products_path())
 
-    pages_df, products_df = build_frames(page_rows_all, product_rows_all)
+    pages_df = pd.read_parquet(cfg.pages_path())
+    products_df = pd.read_parquet(cfg.products_path())
     print(f"[export] {cfg.pages_path()} ({len(pages_df)} pages) | "
           f"{cfg.products_path()} ({len(products_df)} products) | new this run: {n_new}")
 

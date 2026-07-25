@@ -422,12 +422,20 @@ def _softmax_conf(scores: Dict[str, float]) -> float:
 def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
                   prior: Optional[dict] = None, n_products: int = 0,
                   chat_brands: Optional[set] = None,
-                  domain_profile: Optional[dict] = None) -> PageClass:
+                  domain_profile: Optional[dict] = None,
+                  directory_entry: "Optional[DomainEntry]" = None,
+                  content_scope: str = "page") -> PageClass:
     """``domain_profile`` is knowledge *learned from other pages of the same
     domain* ({"relevance": 0..1, "seller": ...}): it floors topical relevance
     and fills a missing seller_type, so URLs skipped by the fetch policy (or
     unreachable) still classify from what the domain already taught us —
-    without ever copying a page-level label across the domain."""
+    without ever copying a page-level label across the domain.
+    ``directory_entry`` is offline knowledge about the *site* (see
+    :mod:`conveyer.scraping.directory`): its role votes when the curated
+    domain lists are silent, and its site category stands in for the vendor
+    prior. ``content_scope`` says whose words ``page`` carries — "page" (its
+    own), "base" (the base URL's), "directory" (the entry's description) or
+    "none": only the page's OWN content may prove it unrelated."""
     chat_brands = chat_brands or set()
     u = parse_url(url or page.url)
     prior = prior or {}
@@ -488,8 +496,7 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
         cat_scores[category_for_subtype(sub)] = cat_scores.get(category_for_subtype(sub), 0.0) + w
     confidence = _softmax_conf(cat_scores)
 
-    relevance = _skincare_relevance(page, u, chat_brands,
-                                    str(prior.get(cfg.col_site_category, "")))
+    relevance = _skincare_relevance(page, u, chat_brands, prior_cat)
     profile_used = False
     if domain_profile:
         prof_rel = float(domain_profile.get("relevance", 0.0) or 0.0)
@@ -640,10 +647,13 @@ def classify_llm(page: PageContent, url: str, cfg: ScrapeConfig,
 def classify_page(page: PageContent, url: str, cfg: ScrapeConfig,
                   prior: Optional[dict] = None, n_products: int = 0,
                   chat_brands: Optional[set] = None,
-                  domain_profile: Optional[dict] = None) -> PageClass:
+                  domain_profile: Optional[dict] = None,
+                  directory_entry: "Optional[DomainEntry]" = None,
+                  content_scope: str = "page") -> PageClass:
     """Full classification with the configured strategy and graceful fallback."""
     result = classify_rule(page, url, cfg, prior=prior, n_products=n_products,
-                           chat_brands=chat_brands, domain_profile=domain_profile)
+                           chat_brands=chat_brands, domain_profile=domain_profile,
+                           directory_entry=directory_entry, content_scope=content_scope)
     want_llm = cfg.classifier == "llm" or (cfg.classifier == "auto"
                                            and result.confidence < 0.55 and _llm_available(cfg))
     if want_llm and _llm_available(cfg):

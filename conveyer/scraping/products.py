@@ -208,8 +208,14 @@ def _product_heuristic(page: PageContent) -> Optional[ProductRecord]:
     return rec if rec.name else None
 
 
-def extract_products(page: PageContent, max_products: int = 40) -> List[ProductRecord]:
-    """All products found on a page, best structured source first, de-duplicated."""
+def extract_products(page: PageContent, max_products: int = 40,
+                     include_heuristic: bool = True) -> List[ProductRecord]:
+    """All products found on a page, best structured source first, de-duplicated.
+
+    ``include_heuristic=False`` disables the last-resort text-price heuristic —
+    the pipeline passes that on transactional URLs (cart/checkout/order),
+    where an h1 like "All Carts" plus an incidental "$10" in the copy would
+    otherwise mint a phantom product."""
     out: List[ProductRecord] = []
     for obj in iter_jsonld_objects(page.jsonld):
         rec = _product_from_jsonld(obj)
@@ -221,7 +227,7 @@ def extract_products(page: PageContent, max_products: int = 40) -> List[ProductR
     og = _product_from_opengraph(page)
     if og and not any(_same_product(og, r) for r in out):
         out.append(og)
-    if not out:
+    if not out and include_heuristic:
         h = _product_heuristic(page)
         if h:
             out.append(h)

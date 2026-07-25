@@ -6,7 +6,7 @@ when available, the SimilarWeb ``dim_digital_site`` prior), decide the headline
 *shopping* (retailer or brand-owned), *unrelated* — and the four proposed extra
 categories (*editorial, search, community, reference*).
 
-The classifier is **multimodal**: four independent evidence channels vote and
+The classifier is **multimodal**: five independent evidence channels vote and
 any one of them can carry a page on its own —
 
 1. **URL structure** — path/query tokens (``/cart/``, ``checkout``,
@@ -16,7 +16,12 @@ any one of them can carry a page on its own —
    (``amazon.com`` *is* a retailer, fetched or not);
 3. **page content & markup** — schema.org ``@type``, OpenGraph, price /
    add-to-cart / product-count signals (only when the page was fetched);
-4. **vendor prior** — ``dim_digital_site.page_type`` when available.
+4. **vendor prior** — ``dim_digital_site.page_type`` when available;
+5. **domain directory** — a :class:`~conveyer.scraping.directory.DomainEntry`
+   (role + description) for domains the curated lists don't know, sourced
+   from the built-in seed or the external file at
+   ``ScrapeConfig.directory_path``. Its description can also stand in as
+   content when the page is unfetchable (``content_scope="directory"``).
 
 Votes are summed, the argmax wins with a softmax confidence, and
 ``PageClass.signals`` records which modalities actually fired so every label is
@@ -48,8 +53,11 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:  # runtime-free: directory.py imports classify, not vice versa
+    from .directory import DomainEntry
 
 from ..brands import BRAND_DOMAIN_CORES
 from ..ingest import normalize
@@ -183,10 +191,46 @@ TOPIC_NEUTRAL_SUBTYPES = {"cart", "checkout", "order", "serp", "site_search",
 # live: /checkouts/c/<token> on an unheard-of Shopify store is still a checkout.
 TRANSACTIONAL_SUBTYPES = {"cart", "checkout", "order", "wishlist"}
 
+# A path-anchored transactional vote at or above this weight is treated as
+# near-deterministic: /cart/, /checkouts/, /gp/cart, order-history. The weak
+# query hints (ref_=nav_cart 1.0, checkout-in-query 0.8) stay advisory.
+_TRANSACTIONAL_DECISIVE = 2.0
 
-def _known_domain(u: UrlParts) -> bool:
+
+def _transactional_override(url_votes: Dict[str, float]) -> Optional[str]:
+    """The transactional subtype the URL *path* proves, if any.
+
+    A page under /cart/ or /checkouts/ IS a cart/checkout no matter how
+    PDP-ish its body looks: cart pages necessarily show prices and
+    add-to-cart/checkout phrases, so those markup signals must never outvote
+    the URL (the amazon ``/cart/add-to-cart/…`` page scored pdp 3.5 vs cart
+    2.5 from exactly that furniture and collapsed to 'unrelated')."""
+    cands = {s: w for s, w in url_votes.items()
+             if s in TRANSACTIONAL_SUBTYPES and w >= _TRANSACTIONAL_DECISIVE}
+    if not cands:
+        return None
+    return max(cands, key=cands.get)
+
+
+def is_transactional_url(url: str) -> bool:
+    """URL-only: does the path carry a decisive cart/checkout/order/wishlist
+    token? The pipeline uses this to suppress the *heuristic* product
+    extractor on such pages — a cart's prices are its line items and page
+    furniture, not evidence of a product-detail page."""
+    return _transactional_override(_url_subtype_votes(parse_url(url))) is not None
+
+
+_DECISIVE_ROLES = {"marketplace", "retailer", "brand", "search", "community",
+                   "editorial", "reference"}
+
+
+def _known_domain(u: UrlParts, directory_entry: "Optional[DomainEntry]" = None) -> bool:
     """Domain modality has an opinion: the registrable domain is in one of the
-    curated lists (or is .gov/.edu), so its role is known without fetching."""
+    curated lists (or is .gov/.edu, or the domain directory knows its role),
+    so its role is known without fetching."""
+    if directory_entry is not None and \
+            getattr(directory_entry, "role", "") in _DECISIVE_ROLES:
+        return True
     tld = u.registrable.rsplit(".", 1)[-1] if u.registrable else ""
     return (u.core in RETAILER_DOMAINS or u.core in BRAND_DOMAINS
             or u.core in SEARCH_DOMAINS or u.core in COMMUNITY_DOMAINS
@@ -280,6 +324,31 @@ def _domain_votes(u: UrlParts, page: PageContent, chat_brands: set) -> Dict[str,
     return v
 
 
+# directory role -> subtype votes, mirroring the curated-list weights in
+# _domain_votes so an external-file retailer behaves exactly like a curated one
+_ROLE_SUBTYPE_VOTES: Dict[str, Dict[str, float]] = {
+    "search": {"serp": 3.0},
+    "community": {"forum": 3.0},
+    "editorial": {"article": 2.5},
+    "reference": {"wiki": 2.5},
+    "brand": {"brand_site": 1.5},
+    "retailer": {"listing": 0.6},
+    "marketplace": {"marketplace": 1.2, "listing": 0.6},
+}
+
+
+def _directory_votes(entry: "Optional[DomainEntry]", u: UrlParts) -> Dict[str, float]:
+    """Votes from the domain directory's role — only consulted when the curated
+    domain lists had nothing to say, so the two never double-count."""
+    if entry is None:
+        return {}
+    role = getattr(entry, "role", "")
+    v = dict(_ROLE_SUBTYPE_VOTES.get(role, {}))
+    if role in ("retailer", "marketplace") and u.path in _ROOT_PATHS:
+        v["marketplace"] = v.get("marketplace", 0.0) + 2.6
+    return v
+
+
 def _markup_votes(page: PageContent, n_products: int) -> Dict[str, float]:
     v: Dict[str, float] = {}
     types = set(page.schema_types())
@@ -362,12 +431,16 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     chat_brands = chat_brands or set()
     u = parse_url(url or page.url)
     prior = prior or {}
+    entry_role = getattr(directory_entry, "role", "") if directory_entry is not None else ""
 
-    # each modality votes independently; any one can carry the page alone
+    # each modality votes independently; any one can carry the page alone.
+    # The directory only speaks when the curated domain lists are silent.
+    domain_votes = _domain_votes(u, page, chat_brands)
     modality_votes = {
         "url": _url_subtype_votes(u),
-        "domain": _domain_votes(u, page, chat_brands),
+        "domain": domain_votes,
         "markup": _markup_votes(page, n_products),
+        "directory": {} if domain_votes else _directory_votes(directory_entry, u),
     }
     votes: Dict[str, float] = {}
     for src in modality_votes.values():
@@ -388,13 +461,26 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     if has_content and "markup" not in signals:
         signals.append("content")
 
+    # the SimilarWeb site-category prior, with the directory's category as the
+    # stand-in when the vendor table is silent about this domain
+    prior_cat = str(prior.get(cfg.col_site_category, "") or "")
+    if not prior_cat and directory_entry is not None:
+        prior_cat = getattr(directory_entry, "category", "") or ""
+
     if not votes:
         return PageClass(page_category="unknown", page_subtype="other",
                          confidence=0.0, method="rule", signals=signals,
                          skincare_relevance=_skincare_relevance(page, u, chat_brands,
-                                                                str(prior.get(cfg.col_site_category, ""))))
+                                                                prior_cat))
 
     subtype = max(votes, key=votes.get)
+    # decisive transactional URL tokens win the subtype outright: prices and
+    # checkout buttons are *expected furniture* on a cart page, so the markup
+    # channel's pdp votes are not evidence against the URL's /cart/ path
+    override = _transactional_override(modality_votes["url"])
+    if override is not None and subtype != override:
+        subtype = override
+        signals.append("url_override")
     category = category_for_subtype(subtype)
     # collapse subtype votes into category-level scores for confidence
     cat_scores: Dict[str, float] = {}
@@ -412,12 +498,14 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     known = _known_domain(u) or (domain_profile is not None
                                  and float(domain_profile.get("relevance", 0) or 0) >= 0.15)
     # the winning subtype must be *earned* by structural evidence: a URL/markup
-    # vote, a matching vendor prior, or a decisive domain role (>= 2.0 — search
-    # engine, community, editorial, reference, storefront root). The retailer
-    # catch-alls (listing 0.6, bare marketplace 1.2) earn nothing on their own.
+    # vote, a matching vendor prior, or a decisive domain/directory role
+    # (>= 2.0 — search engine, community, editorial, reference, storefront
+    # root). The retailer catch-alls (listing 0.6, bare marketplace 1.2) earn
+    # nothing on their own.
     prior_sub = SIMILARWEB_PAGE_TYPE_TO_SUBTYPE.get(prior_page_type) if prior_fired else None
     earned = (subtype in modality_votes["url"] or subtype in modality_votes["markup"]
-              or subtype == prior_sub or modality_votes["domain"].get(subtype, 0.0) >= 2.0)
+              or subtype == prior_sub or modality_votes["domain"].get(subtype, 0.0) >= 2.0
+              or modality_votes["directory"].get(subtype, 0.0) >= 2.0)
     # a SERP whose URL exposes the query is NOT topic-neutral — the query text
     # itself decides relevance (q=best+retinol vs q=gaming+laptops)
     serp_with_query = subtype in ("serp", "site_search") and \
@@ -432,9 +520,10 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     # seller type (only meaningful for commerce categories)
     seller = "na"
     if is_commerce(category) or subtype in ("brand_site", "marketplace", "listing", "pdp", "collection"):
-        if subtype == "brand_site" or u.core in BRAND_DOMAINS:
+        if subtype == "brand_site" or u.core in BRAND_DOMAINS or entry_role == "brand":
             seller = "brand_owned"
-        elif u.core in RETAILER_DOMAINS or prior.get(cfg.col_retailer_brand):
+        elif (u.core in RETAILER_DOMAINS or prior.get(cfg.col_retailer_brand)
+              or entry_role in ("retailer", "marketplace")):
             seller = "retailer"
         elif str(prior.get(cfg.col_seller_type, "")).lower() in ("1p", "3p"):
             seller = "retailer"
@@ -443,23 +532,30 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
             profile_used = True
 
     # topical relevance overrides the headline bucket (user's "unrelated" case).
-    # "unrelated" is a *confident* judgement — it needs fetched content to
-    # stand on. Without content, an *earned* structural role stands in: an
-    # unfetched amazon.com/dp/… is still a shopping page, an unfetched
+    # "unrelated" is a *confident* judgement — it needs the page's OWN content
+    # to stand on; stand-in content (base page / directory description) is
+    # domain-level evidence and cannot prove a deep link off-topic. Without
+    # real content an *earned* structural role stands in: an unfetched
+    # amazon.com/dp/… is still a shopping page, an unfetched
     # /checkouts/c/<token> is still a checkout. A page whose only support is
-    # the retailer catch-all (sephora.com/careers) tells us nothing → unknown.
+    # the weak retailer catch-all (sephora.com/careers) tells us nothing — and
+    # a domain description alone must not mint a category for it → unknown.
+    real_content = has_content and content_scope == "page"
     final_category = category
-    if not is_relevant and category != "unknown":
-        if has_content:
-            final_category = "unrelated"
-        elif not (earned and (known or self_evident)):
+    if category != "unknown":
+        if not is_relevant:
+            if real_content:
+                final_category = "unrelated"
+            elif not (earned and (known or self_evident)):
+                final_category = "unknown"
+        elif not real_content and not (earned or self_evident):
             final_category = "unknown"
 
     # page-intrinsic brand (the brand this page is *about*) — used for matching.
     # Deliberately NOT the chat brand: letting a brand-less product inherit the
     # chat brand would make everything trivially "coincide".
     page_brand = ""
-    if u.core in BRAND_DOMAINS:
+    if u.core in BRAND_DOMAINS or entry_role == "brand":
         page_brand = u.core
     elif page.og.get("product:brand"):
         page_brand = normalize(page.og["product:brand"])

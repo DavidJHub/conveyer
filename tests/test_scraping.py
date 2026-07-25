@@ -440,6 +440,171 @@ def test_base_url_fallback():
 
 
 # --------------------------------------------------------------------------- #
+# Domain-directory fallback (robots_blocked / bot walls / dead hosts)
+# --------------------------------------------------------------------------- #
+def test_directory_seed_and_content():
+    from conveyer.scraping.directory import directory_content, lookup
+    e = lookup("https://www.amazon.co.uk/gp/cart/view.html")
+    _check(e is not None and e.role == "marketplace", f"amazon entry: {e}")
+    e2 = lookup("sephora.com")
+    _check(e2 is not None and "skincare" in e2.description.lower(),
+           "beauty retailer description must carry topical words")
+    pc = directory_content(e2, "https://www.sephora.com/x")
+    _check(bool(pc.text) and pc.parser == "directory", "stand-in content")
+    _check(lookup("https://nobody-knows-this-site.xyz/") is None, "unknown -> None")
+
+
+def test_directory_robots_blocked_fallback():
+    """A robots-blocked URL on a known domain classifies from the directory's
+    description (fetch_scope='directory'); the description supplies relevance
+    but must never mint a category the URL didn't structurally earn."""
+    from conveyer.scraping.fetch import FetchResult
+    from conveyer.scraping.pipeline import _process_one
+    from conveyer.scraping.sources import ScrapeSources
+
+    cfg = ScrapeConfig()                      # offline, empty corpus
+    src = ScrapeSources(urls=pd.DataFrame(), mentions={})
+    fetcher = Fetcher(cfg, html_by_url={})    # base fallback will offline_miss
+
+    url = "https://www.sephora.com/shop/face-cream"
+    fr = FetchResult(url=url, status="robots_blocked")
+    pr, prods = _process_one(cfg, src, {"url": url}, fr, fetcher)
+    _check(pr["fetch_scope"] == "directory", f"scope {pr['fetch_scope']}")
+    _check(pr["page_category"] == "catalogue", f"blocked /shop -> {pr['page_category']}")
+    _check(pr["seller_type"] == "retailer", f"seller {pr['seller_type']}")
+    _check(pr["is_study_relevant"], "beauty-retailer description supplies relevance")
+    _check("directory_content" in list(pr["classification_signals"]),
+           f"signals {pr['classification_signals']}")
+    _check(prods == [], "no products may come from a directory stand-in")
+
+    # no structural evidence in the URL -> the description alone is not enough
+    url2 = "https://www.sephora.com/careers"
+    pr2, _ = _process_one(cfg, src, {"url": url2},
+                          FetchResult(url=url2, status="robots_blocked"), fetcher)
+    _check(pr2["page_category"] == "unknown", f"blocked /careers -> {pr2['page_category']}")
+
+    # blocked cart on a marketplace: transactional URL token stays decisive
+    url3 = "https://www.amazon.com/gp/cart/view.html?ref_=nav_cart"
+    pr3, _ = _process_one(cfg, src, {"url": url3},
+                          FetchResult(url=url3, status="robots_blocked"), fetcher)
+    _check(pr3["fetch_scope"] == "directory", f"scope {pr3['fetch_scope']}")
+    _check(pr3["page_category"] == "shopping" and pr3["page_subtype"] == "cart",
+           f"{pr3['page_category']}/{pr3['page_subtype']}")
+    _check(pr3["funnel_stage"] == "Purchase", f"funnel {pr3['funnel_stage']}")
+
+
+def test_directory_external_file_extends_lists():
+    """External JSON entries behave like curated domains: role votes fire (the
+    'directory' signal), seller_type resolves, and neutrality is earned."""
+    from conveyer.scraping.directory import lookup
+    from conveyer.scraping.extract import PageContent
+
+    tmp = tempfile.mkdtemp(prefix="conveyer_dir_")
+    try:
+        path = os.path.join(tmp, "domain_directory.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"glowmarket.com": {
+                "name": "GlowMarket", "role": "retailer",
+                "category": "beauty_and_cosmetics",
+                "description": "Online beauty retailer selling skincare and cosmetics."}}, fh)
+        entry = lookup("https://glowmarket.com/cart", path)
+        _check(entry is not None and entry.role == "retailer" and entry.source == "file",
+               f"external entry: {entry}")
+        cfg = ScrapeConfig(directory_path=path)
+        url = "https://glowmarket.com/cart"
+        r = classify_rule(PageContent(url=url), url, cfg, directory_entry=entry)
+        _check(r.page_category == "shopping" and r.page_subtype == "cart",
+               f"{r.page_category}/{r.page_subtype}")
+        _check(r.seller_type == "retailer", f"seller {r.seller_type}")
+        _check(r.funnel_stage == "Purchase", f"funnel {r.funnel_stage}")
+        _check("directory" in r.signals, f"role votes must fire: {r.signals}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Transactional URLs must beat cart-furniture markup (the amazon add-to-cart
+# regression: fetched cart page scored pdp 3.5 vs cart 2.5 and collapsed to
+# 'unrelated' because a cart shows prices/checkout buttons by nature)
+# --------------------------------------------------------------------------- #
+AMAZON_CART_HTML = """<!doctype html><html lang="en-us"><head>
+<title>Amazon.com Shopping Cart</title></head>
+<body><h1>All Carts</h1><p>Your Amazon Cart is empty. Shop today's deals.
+Under $10. Beauty &amp; Personal Care. Electronics. Toys &amp; Games.
+Proceed to checkout. Check out Amazon Cart.</p>
+<a href="/checkout">Proceed to checkout</a><a href="/deals">Shop deals</a>
+</body></html>"""
+AMAZON_CART_URL = "https://www.amazon.com/cart/add-to-cart/ref=dp_start-bbf_1_glance"
+
+
+def test_transactional_url_beats_pdp_markup():
+    cfg = ScrapeConfig()
+    page = extract_page(AMAZON_CART_HTML, AMAZON_CART_URL)
+    _check(page.has_price and page.has_add_to_cart,
+           "the misleading cart furniture must be present for this test to bite")
+    # even with a phantom product counted, the URL's /cart/ path must win
+    r = classify_rule(page, AMAZON_CART_URL, cfg, n_products=1)
+    _check(r.page_subtype == "cart", f"subtype {r.page_subtype} (want cart)")
+    _check(r.page_category == "shopping", f"category {r.page_category}")
+    _check(r.funnel_stage == "Purchase", f"funnel {r.funnel_stage}")
+    _check(r.is_study_relevant, "a cart on a known retailer is journey infrastructure")
+    _check("url_override" in r.signals, f"override must be audited: {r.signals}")
+    # a real PDP with only a cart-ish QUERY hint must NOT be overridden
+    pdp_url = "https://www.amazon.com/dp/B00365FJ8K?ref_=nav_cart"
+    r2 = classify_rule(extract_page("", pdp_url), pdp_url, cfg)
+    _check(r2.page_subtype == "pdp", f"query hint must stay advisory: {r2.page_subtype}")
+
+
+def test_no_phantom_products_on_transactional_pages():
+    from conveyer.scraping.classify import is_transactional_url
+    _check(is_transactional_url(AMAZON_CART_URL), "cart path is transactional")
+    _check(not is_transactional_url("https://www.amazon.com/dp/B00365FJ8K"),
+           "pdp is not transactional")
+    page = extract_page(AMAZON_CART_HTML, AMAZON_CART_URL)
+    with_h = extract_products(page)
+    _check(len(with_h) == 1 and with_h[0].source == "heuristic",
+           f"the phantom exists without the guard: {[(p.name, p.source) for p in with_h]}")
+    _check(extract_products(page, include_heuristic=False) == [],
+           "no heuristic phantom on transactional pages")
+
+
+def test_validate_repairs_unrelated_cart():
+    """The URL-rule double check must flag and repair a stored
+    unrelated/pdp/Irrelevant row whose URL alone proves shopping/cart/Purchase."""
+    from conveyer.scraping.validate import apply_validation, validation_report, write_pages
+    out = tempfile.mkdtemp(prefix="conveyer_validate_")
+    try:
+        art = run_scrape(ScrapeConfig(synthetic_n_pages=20, out_dir=out, progress_every=0))
+        pages = art["pages"].copy()
+        _check(validation_report(pages).empty, "a fresh run must validate clean")
+        # corrupt one cart row the way the old classifier failed
+        mask = pages["page_subtype"] == "cart"
+        _check(mask.any(), "corpus has a cart page")
+        idx = pages.index[mask][0]
+        pages.loc[idx, ["page_category", "page_subtype", "funnel_stage",
+                        "is_study_relevant"]] = ["unrelated", "pdp", "Irrelevant", False]
+        rep = validation_report(pages)
+        _check(len(rep) == 1 and rep.iloc[0]["mismatch"] == "category",
+               f"corruption must be flagged: {rep.to_dict('records')}")
+        fixed, rep2 = apply_validation(pages)
+        row = fixed.loc[idx]
+        _check(row["page_category"] == "shopping" and row["page_subtype"] == "cart",
+               f"repaired to {row['page_category']}/{row['page_subtype']}")
+        _check(row["funnel_stage"] == "Purchase" and bool(row["is_study_relevant"]),
+               f"funnel {row['funnel_stage']}")
+        _check("url_validated" in list(row["classification_signals"]), "repair audited")
+        # repaired frame must round-trip through the pinned parquet schema
+        path = os.path.join(out, "repaired.parquet")
+        write_pages(fixed, path)
+        back = pd.read_parquet(path)
+        _check(len(back) == len(fixed) and
+               back.set_index("page_id").loc[row["page_id"], "page_subtype"] == "cart",
+               "parquet round-trip keeps the repair")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # Incremental persistence & resume
 # --------------------------------------------------------------------------- #
 def test_incremental_jsonl_and_resume():
@@ -464,6 +629,73 @@ def test_incremental_jsonl_and_resume():
         _check(art2["evaluation"]["category_accuracy"] == 1.0, "eval intact after resume")
     finally:
         shutil.rmtree(out, ignore_errors=True)
+
+
+def test_checkpoint_parts_bounded_memory():
+    """Checkpoints must flush buffered rows to parquet part files (freeing
+    memory) and the final parquet must be streamed from those parts. A
+    pre-parts-format output (JSONL only) must migrate automatically."""
+    from conveyer.scraping.schema import part_files
+    out = tempfile.mkdtemp(prefix="conveyer_parts_")
+    try:
+        cfg = ScrapeConfig(synthetic_n_pages=12, out_dir=out, progress_every=0,
+                           checkpoint_every=5)
+        art = run_scrape(cfg)
+        parts = part_files(cfg.pages_parts_dir())
+        _check(len(parts) == 3, f"12 pages / checkpoint 5 -> 3 parts, got {len(parts)}")
+        _check(len(art["pages"]) == 12, "final parquet complete")
+        _check(art["pages"]["page_id"].nunique() == 12, "no duplicates")
+
+        # rerun: nothing pending, nothing duplicated, parts untouched
+        art2 = run_scrape(cfg)
+        _check(art2["n_new"] == 0, f"nothing to redo, n_new {art2['n_new']}")
+        _check(len(art2["pages"]) == 12 and art2["pages"]["page_id"].nunique() == 12,
+               "rerun keeps the table intact")
+        _check(len(part_files(cfg.pages_parts_dir())) == 3, "no empty/dup parts appended")
+
+        # old-format migration: JSONL exists but parts are gone
+        shutil.rmtree(cfg.pages_parts_dir())
+        shutil.rmtree(cfg.products_parts_dir(), ignore_errors=True)
+        art3 = run_scrape(cfg)
+        _check(art3["n_new"] == 0, "JSONL alone is enough to resume")
+        _check(len(art3["pages"]) == 12 and art3["pages"]["page_id"].nunique() == 12,
+               f"parts rebuilt from the JSONL commit log: {len(art3['pages'])}")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_offline_cache_is_lazy_and_html_path_recorded():
+    """Offline mode must serve previously fetched pages from the per-URL disk
+    cache (never preloading a corpus), and the page row must record where the
+    raw HTML lives (html_path)."""
+    from conveyer.scraping.fetch import FetchResult
+    from conveyer.scraping.fetch import _cache_path as cache_path_for
+    from conveyer.scraping.pipeline import _process_one
+    from conveyer.scraping.sources import ScrapeSources
+
+    tmp = tempfile.mkdtemp(prefix="conveyer_htmlcache_")
+    try:
+        cfg = ScrapeConfig(cache_dir=os.path.join(tmp, "cache"))
+        url = "https://cerave.com/products/moisturizing-cream"
+        # simulate a previous online run having cached the page
+        writer = Fetcher(cfg)
+        writer._write_cache(FetchResult(url=url, status="ok", http_status=200,
+                                        final_url=url, content_type="text/html",
+                                        html=PROD_HTML, fetched_at="t"))
+        # a fresh offline fetcher with NO corpus must find it on disk, lazily
+        reader = Fetcher(cfg, html_by_url={})
+        fr = reader.fetch(url)
+        _check(fr.ok and fr.from_cache, f"lazy disk-cache hit: {fr.status}")
+
+        src = ScrapeSources(urls=pd.DataFrame(), mentions={})
+        pr, prods = _process_one(cfg, src, {"url": url}, fr, reader)
+        _check(pr["html_path"] == cache_path_for(cfg, url),
+               f"html_path must point at the cache file: {pr['html_path']}")
+        _check(os.path.exists(pr["html_path"]), "the file actually exists")
+        _check(pr["page_category"] == "shopping" and len(prods) >= 1,
+               "cached page classifies and yields products as if fetched")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #

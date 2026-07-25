@@ -37,10 +37,10 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from .classify import PageClass, classify_page
+from .classify import PageClass, classify_page, parse_url
 from .config import ScrapeConfig
 from .extract import PageContent, extract_page
-from .fetch import Fetcher, FetchResult, _cache_path, base_url_of
+from .fetch import Fetcher, FetchResult, _cache_path, _now, base_url_of
 from .products import extract_products, match_products
 from .schema import (PAGE_SCHEMA, PRODUCT_SCHEMA, build_frames, page_row,
                      product_rows, write_parquet)
@@ -122,8 +122,82 @@ def _prior_for(cfg: ScrapeConfig, row: dict) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# Domain-level reuse: fetch policy + learned domain profiles
+# --------------------------------------------------------------------------- #
+# URL tokens already decide these completely, and they carry nothing worth
+# extracting (no products on a cart, no prose on a SERP) — fetching them buys
+# nothing but rate-limit seconds.
+_NEVER_FETCH_SUBTYPES = {"cart", "checkout", "order", "wishlist", "serp", "site_search"}
+
+
+def _fetch_decision(url: str, cfg: ScrapeConfig, domain_budget: Dict[str, int]) -> Tuple[bool, str]:
+    """(fetch?, reason). Only consulted online; offline corpus serving is free.
+
+    "smart": skip URL-decided transactional pages, and cap content fetches per
+    domain — the first ``max_fetch_per_domain`` URLs of a domain build its
+    profile (and yield products); the rest classify from URL + profile.
+    """
+    if cfg.offline or cfg.fetch_policy == "always":
+        return True, ""
+    if cfg.fetch_policy == "never":
+        return False, "fetch_policy=never"
+    from .classify import classify_rule
+    from .extract import PageContent
+
+    sub = classify_rule(PageContent(url=url), url, cfg).page_subtype
+    if sub in _NEVER_FETCH_SUBTYPES:
+        return False, f"smart policy: '{sub}' is URL-decided"
+    dom = parse_url(url).registrable or url
+    if domain_budget.get(dom, 0) >= cfg.max_fetch_per_domain:
+        return False, f"smart policy: domain budget ({cfg.max_fetch_per_domain}) reached"
+    domain_budget[dom] = domain_budget.get(dom, 0) + 1
+    return True, ""
+
+
+def _profiles_path(cfg: ScrapeConfig) -> str:
+    return os.path.join(cfg.out_dir, "domain_profiles.json")
+
+
+def _load_profiles(cfg: ScrapeConfig) -> Dict[str, dict]:
+    if not cfg.use_domain_profiles or not os.path.exists(_profiles_path(cfg)):
+        return {}
+    try:
+        with open(_profiles_path(cfg), "r", encoding="utf-8") as fh:
+            return {str(k): dict(v) for k, v in json.load(fh).items()}
+    except Exception:
+        return {}
+
+
+def _save_profiles(cfg: ScrapeConfig, profiles: Dict[str, dict]) -> None:
+    if not cfg.use_domain_profiles or not profiles:
+        return
+    try:
+        with open(_profiles_path(cfg), "w", encoding="utf-8") as fh:
+            json.dump(profiles, fh, indent=1, sort_keys=True)
+    except Exception:
+        pass
+
+
+def _learn_profile(profiles: Dict[str, dict], pr: dict) -> None:
+    """Fold one content-bearing page row into its domain's profile."""
+    if pr.get("fetch_scope") not in ("page", "base"):
+        return
+    dom = pr.get("domain")
+    if not dom:
+        return
+    p = profiles.setdefault(dom, {"relevance": 0.0, "seller": "na", "n_pages": 0})
+    p["relevance"] = round(max(float(p.get("relevance", 0.0)),
+                               float(pr.get("skincare_relevance", 0.0))), 3)
+    if p.get("seller") in (None, "na") and pr.get("seller_type") in ("brand_owned", "retailer"):
+        p["seller"] = pr["seller_type"]
+    p["n_pages"] = int(p.get("n_pages", 0)) + 1
+
+
 def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
-                 fr: FetchResult, fetcher: Fetcher) -> Tuple[dict, List[dict]]:
+                 fr: FetchResult, fetcher: Fetcher,
+                 profiles: Optional[Dict[str, dict]] = None,
+                 allow_base: bool = True) -> Tuple[dict, List[dict]]:
     """fetch result → (page_row, product_rows). Never raises: any extraction or
     classification error degrades to an 'unknown' page row so one bad page
     cannot kill a long run.
@@ -141,7 +215,7 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
         scope = "page" if fr.ok else "none"
         content = extract_page(fr.html, url=url, parser=cfg.html_parser) if fr.ok \
             else PageContent(url=url)
-        if not fr.ok and cfg.base_fallback:
+        if not fr.ok and cfg.base_fallback and allow_base:
             base = base_url_of(url)
             if base:
                 frb = fetcher.fetch(base)
@@ -154,8 +228,12 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
             if scope == "page" else []
         chat_brands = chat_brands_for(row_d, src.mentions)
         mentions = mentions_for(row_d, src.mentions)
+        profile = None
+        if cfg.use_domain_profiles and profiles and scope != "page":
+            profile = profiles.get(parse_url(url).registrable)
         cls = classify_page(content, url, cfg, prior=_prior_for(cfg, row_d),
-                            n_products=len(products), chat_brands=chat_brands)
+                            n_products=len(products), chat_brands=chat_brands,
+                            domain_profile=profile)
         if scope == "base":
             cls.signals = [s for s in cls.signals if s != "content"] + ["base_content"]
         mid = (row_d.get("message_ids") or [""])[0]
@@ -209,44 +287,74 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
     print(f"[fetch] mode={mode} | pending={len(pending)} | workers={cfg.max_workers} | "
           f"per-url cap={cfg.hard_timeout:.0f}s | line-by-line -> {cfg.pages_jsonl_path()}")
 
-    n_new = n_ok = n_err = 0
+    profiles = _load_profiles(cfg)
+    domain_budget: Dict[str, int] = {}
+    to_fetch: List[str] = []
+    deferred: List[Tuple[str, str]] = []
+    for u in pending:
+        do_fetch, reason = _fetch_decision(u, cfg, domain_budget)
+        if do_fetch:
+            to_fetch.append(u)
+        else:
+            deferred.append((u, reason))
+    if deferred:
+        print(f"[fetch-policy] {len(to_fetch)} URLs to fetch | {len(deferred)} classified "
+              f"without network (URL-decided or over the per-domain budget)")
+
+    n_new = n_ok = n_err = n_circuit = 0
     t_start = time.monotonic()
     pages_fh = open(cfg.pages_jsonl_path(), "a", encoding="utf-8")
     products_fh = open(cfg.products_jsonl_path(), "a", encoding="utf-8")
+
+    def handle(fr: FetchResult, allow_base: bool = True) -> None:
+        nonlocal n_new, n_ok, n_err, n_circuit
+        row_d = row_by_url.get(fr.url, {"url": fr.url})
+        pr, prods = _process_one(cfg, src, row_d, fr, fetcher, profiles,
+                                 allow_base=allow_base)
+        _learn_profile(profiles, pr)
+
+        # products first, page line last: the page line is the commit marker
+        for p in prods:
+            products_fh.write(json.dumps(p, ensure_ascii=False, default=str) + "\n")
+        products_fh.flush()
+        pages_fh.write(json.dumps(pr, ensure_ascii=False, default=str) + "\n")
+        pages_fh.flush()
+
+        page_rows_all.append(pr)
+        product_rows_all.extend(prods)
+        n_new += 1
+        n_ok += int(fr.ok)
+        n_err += int(not fr.ok and fr.status not in ("skipped", "circuit_open"))
+        n_circuit += int(fr.status == "circuit_open")
+
+        if cfg.progress_every and n_new % cfg.progress_every == 0:
+            el = time.monotonic() - t_start
+            rate = n_new / el if el > 0 else 0.0
+            eta = (len(pending) - n_new) / rate if rate > 0 else float("inf")
+            print(f"[progress] {n_new}/{len(pending)} pages | ok={n_ok} err={n_err} "
+                  f"circuit={n_circuit} | {rate:.1f} pages/s | eta {eta/60:.1f} min",
+                  flush=True)
+        if cfg.checkpoint_every and n_new % cfg.checkpoint_every == 0:
+            write_parquet(page_rows_all, PAGE_SCHEMA, cfg.pages_path())
+            write_parquet(product_rows_all, PRODUCT_SCHEMA, cfg.products_path())
+            _save_profiles(cfg, profiles)
+            print(f"[checkpoint] parquet refreshed at {len(page_rows_all)} pages", flush=True)
+
     try:
-        for fr in fetcher.iter_fetch(pending):
-            row_d = row_by_url.get(fr.url, {"url": fr.url})
-            pr, prods = _process_one(cfg, src, row_d, fr, fetcher)
-
-            # products first, page line last: the page line is the commit marker
-            for p in prods:
-                products_fh.write(json.dumps(p, ensure_ascii=False, default=str) + "\n")
-            products_fh.flush()
-            pages_fh.write(json.dumps(pr, ensure_ascii=False, default=str) + "\n")
-            pages_fh.flush()
-
-            page_rows_all.append(pr)
-            product_rows_all.extend(prods)
-            n_new += 1
-            n_ok += int(fr.ok)
-            n_err += int(not fr.ok)
-
-            if cfg.progress_every and n_new % cfg.progress_every == 0:
-                el = time.monotonic() - t_start
-                rate = n_new / el if el > 0 else 0.0
-                eta = (len(pending) - n_new) / rate if rate > 0 else float("inf")
-                print(f"[progress] {n_new}/{len(pending)} pages | ok={n_ok} err={n_err} | "
-                      f"{rate:.1f} pages/s | eta {eta/60:.1f} min", flush=True)
-            if cfg.checkpoint_every and n_new % cfg.checkpoint_every == 0:
-                write_parquet(page_rows_all, PAGE_SCHEMA, cfg.pages_path())
-                write_parquet(product_rows_all, PRODUCT_SCHEMA, cfg.products_path())
-                print(f"[checkpoint] parquet refreshed at {len(page_rows_all)} pages", flush=True)
+        # fetched pages first — they build the domain profiles ...
+        for fr in fetcher.iter_fetch(to_fetch):
+            handle(fr)
+        # ... which the deferred URLs then classify against, network-free
+        for u, reason in deferred:
+            handle(FetchResult(url=u, status="skipped", error=reason,
+                               fetched_at=_now()), allow_base=False)
     finally:
         pages_fh.close()
         products_fh.close()
         # snapshot whatever we have — also on crash/interrupt
         write_parquet(page_rows_all, PAGE_SCHEMA, cfg.pages_path())
         write_parquet(product_rows_all, PRODUCT_SCHEMA, cfg.products_path())
+        _save_profiles(cfg, profiles)
 
     pages_df, products_df = build_frames(page_rows_all, product_rows_all)
     print(f"[export] {cfg.pages_path()} ({len(pages_df)} pages) | "
@@ -318,6 +426,10 @@ def _parse_args(argv=None) -> ScrapeConfig:
                    help="Wall-clock cap per URL incl. robots + retries (s)")
     p.add_argument("--checkpoint-every", type=int, default=cfg.checkpoint_every)
     p.add_argument("--progress-every", type=int, default=cfg.progress_every)
+    p.add_argument("--fetch-policy", default=cfg.fetch_policy,
+                   choices=["smart", "always", "never"],
+                   help="smart: skip URL-decided pages + cap fetches per domain")
+    p.add_argument("--max-fetch-per-domain", type=int, default=cfg.max_fetch_per_domain)
     p.add_argument("--no-resume", action="store_true",
                    help="Ignore + clear the JSONL sidecars instead of resuming")
     p.add_argument("--no-cache", action="store_true")
@@ -328,6 +440,7 @@ def _parse_args(argv=None) -> ScrapeConfig:
         dedupe_by=a.dedupe_by, only_recommended=a.only_recommended, classifier=a.classifier,
         html_parser=a.parser, synthetic_n_pages=a.synthetic_pages,
         timeout=a.timeout, hard_timeout=a.hard_timeout,
+        fetch_policy=a.fetch_policy, max_fetch_per_domain=a.max_fetch_per_domain,
         checkpoint_every=a.checkpoint_every, progress_every=a.progress_every,
         resume=not a.no_resume, use_cache=not a.no_cache, out_dir=a.out_dir,
     )

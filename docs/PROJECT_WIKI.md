@@ -12,7 +12,7 @@
 | **Status** | v0.3 — pipeline complete, validated on synthetic ground truth; awaiting real-data run |
 | **Input** | one parquet of LLM shopping conversations (schema §4) |
 | **Outputs** | 8 parquet tables + an HTML insight dashboard (§8–§9) |
-| **Tests** | 33 across four suites, all offline (`python tests/test_*.py`) |
+| **Tests** | 36 across four suites, all offline (`python tests/test_*.py`) |
 | **Key docs** | [DATA_DICTIONARY](DATA_DICTIONARY.md) · [FUNNEL_MODEL](FUNNEL_MODEL.md) · [SCRAPED_PAGES_SCHEMA](SCRAPED_PAGES_SCHEMA.md) · [STATE_OF_THE_ART](STATE_OF_THE_ART.md) |
 
 ---
@@ -171,7 +171,14 @@ schema.org/OG/microdata and matched back to the chat's brand mentions
 robots.txt (with bounded timeouts), per-domain rate limiting that never
 blocks other domains, a hard wall-clock cap per URL, caching, and
 line-by-line JSONL persistence with resume — interrupt any time, rerun, it
-continues.
+continues. **Domains are never re-worked**: a circuit breaker skips domains
+that only fail; the smart fetch policy (default online) never fetches
+URL-decided pages (carts, checkouts, SERPs) and caps content fetches per
+domain; and **learned domain profiles** (topical relevance + seller type
+from the pages that were fetched, persisted across runs) classify the rest
+of a domain's URLs without touching the network. Page-level labels are never
+domain-copied — an amazon cart is not an amazon PDP; only domain-level
+knowledge is reused.
 
 ### Module 3 — journey (*did it move the needle*)
 
@@ -262,9 +269,10 @@ Notebooks (committed executed): `01_funnel_pipeline.ipynb` (the whole story),
 
 ## 11 · Quality & validation
 
-* **33 offline tests**: scraping 19 (incl. a local dribbling-server proof
+* **36 offline tests**: scraping 22 (incl. a local dribbling-server proof
   that no URL can hang the run, JSONL resume after a torn file, URL-only
-  classification of carts, base-URL fallback), conversations 7, journey +
+  classification of carts, base-URL fallback, the domain circuit breaker,
+  the smart fetch policy and domain-profile reuse), conversations 7, journey +
   end-to-end 5, dashboard 2.
 * **Synthetic ground truth**: archetype generation → pipeline → recovery
   check on every run (conversion accuracy, exposure detection, positive
@@ -323,6 +331,12 @@ at once.
 
 **A scrape run died mid-way — did I lose it?** No. Rerun the same command;
 the JSONL sidecar resumes, finished pages aren't re-fetched.
+
+**Why does the scraper visit so few URLs per domain?** By design: after
+`max_fetch_per_domain` content fetches, the domain's remaining URLs classify
+from URL tokens + the learned domain profile (relevance, seller) — same
+labels where the URL is decisive, no extra network. `fetch_policy="always"`
+restores exhaustive fetching.
 
 **Can I change what counts as conversion?** `JourneyConfig(conversion_stage=
 "shopping"|"cart"|"checkout")` or `--conversion-stage` on the CLI.

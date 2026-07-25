@@ -74,6 +74,23 @@ class ScrapeConfig:
                                          # scheme://host/ and classify from the
                                          # base page + the original URL's tokens
 
+    # --- Domain-level reuse (why long runs got fast) ------------------------ #
+    fetch_policy: str = "smart"          # smart | always | never (online only —
+                                         # offline always serves the corpus).
+                                         # "smart": skip fetching URLs whose URL
+                                         # tokens already decide them (carts,
+                                         # checkouts, SERPs) and cap fetches per
+                                         # domain; the rest classify from URL +
+                                         # domain profile.
+    max_fetch_per_domain: int = 25       # content sample size per domain; beyond
+                                         # it, URL + learned domain profile decide
+    domain_failure_threshold: int = 3    # consecutive failures with no success
+                                         # before a domain's circuit opens and all
+                                         # its remaining fetches are skipped
+    use_domain_profiles: bool = True     # learn {relevance, seller} per domain
+                                         # from fetched pages, reuse for the rest,
+                                         # persist to out_dir/domain_profiles.json
+
     # --- Parsing / extraction ----------------------------------------------- #
     html_parser: str = "auto"            # auto | stdlib | bs4 (auto prefers bs4 if installed)
     text_excerpt_chars: int = 2000       # truncate stored page text

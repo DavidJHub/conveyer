@@ -165,6 +165,15 @@ coverage:
    `amazon.com/gp/cart/view.html?ref_=nav_cart` still reads
    `shopping · cart · retailer · Purchase`.
 
+Topical relevance (`skincare_relevance`, name kept for schema stability) is
+a **separate axis** from page structure, scored against a **beauty /
+personal-care** vocabulary — skincare, haircare, bodycare and cosmetics —
+extendable per run with `ScrapeConfig(extra_relevance_terms=…)`. A structural
+PDP with fetched content but no topical signal collapses to `unrelated`;
+after a vocabulary update, `python -m conveyer.scraping.validate <pages>
+--reclassify --apply` rescues previously-mislabelled rows from the cached
+HTML without re-scraping (the haircare-conditioner fix).
+
 Product metadata (name, brand, price, rating, SKU) is extracted from
 schema.org/OG/microdata and matched back to the chat's brand mentions
 (`coincides`). Operationally the scraper is built for 100k+ URL runs: obeys
@@ -317,7 +326,7 @@ Notebooks (committed executed): `01_funnel_pipeline.ipynb` (the whole story),
 | **conversion (proxy)** | session reached the configured depth in its trail |
 | **exposure model vs full model** | without vs with post-treatment mediators (browsing volume, dwell) |
 | **fetch_scope** | where page content came from: `page`, `base` (base-URL fallback), `none` |
-| **topic-neutral subtype** | page role that carries no topical tokens by nature (cart, checkout, SERP…) — never demoted for lacking skincare words |
+| **topic-neutral subtype** | page role that carries no topical tokens by nature (cart, checkout, SERP…) — never demoted for lacking topical words |
 
 ## 15 · FAQ
 

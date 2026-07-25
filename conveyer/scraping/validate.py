@@ -17,28 +17,44 @@ Two mismatch kinds are actionable:
   carries a decisive cart/checkout/order token while the stored subtype says
   otherwise (Intent vs **Purchase** — this one moves the conversion proxy).
 
+A second, **content-aware** pass — :func:`reclassify_pages` / ``--reclassify``
+— re-runs the full classifier over stored ``unrelated``/``unknown`` rows using
+the raw HTML each row's ``html_path`` points at in the fetch cache (falling
+back to the stored title/excerpt columns), so a *vocabulary* fix reaches old
+labels without re-scraping anything: labels are burned into the parquet at
+scrape time and ``resume=True`` never revisits a finished URL, which is how
+the jbca.com haircare PDP stayed ``unrelated`` after the relevance lexicon
+was widened from skincare-only to all of beauty / personal care. Repairs are
+**rescue-only**: a row changes only when the fresh verdict is study-relevant
+and lands a real category — rows the new run would demote keep their stored
+label (it may have used vendor-prior or chat-brand context not stored here).
+
 Use it on existing output (no re-scrape needed)::
 
     python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet          # report
     python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet --apply  # repair in place
     python -m conveyer.scraping.validate ... --out fixed.parquet                       # repair to a copy
+    python -m conveyer.scraping.validate ... --reclassify --apply                      # content-aware rescue
 
-or programmatically: :func:`validation_report` / :func:`apply_validation`.
-``run_scrape`` also prints a ``[validate]`` summary after every run, so a
-regression like this can't ship silently again.
+or programmatically: :func:`validation_report` / :func:`apply_validation` /
+:func:`reclassify_pages`. ``run_scrape`` also prints a ``[validate]`` summary
+after every run, so a regression like this can't ship silently again.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import re
 from typing import Optional, Tuple
 
 import pandas as pd
 
-from .classify import TRANSACTIONAL_SUBTYPES, PageClass, classify_rule
+from .classify import TRANSACTIONAL_SUBTYPES, PageClass, classify_page, classify_rule
 from .config import ScrapeConfig
 from .directory import lookup
-from .extract import PageContent
+from .extract import PageContent, extract_page
 from .schema import PAGE_SCHEMA, write_parquet
 
 _REPORT_COLUMNS = ["page_id", "url", "page_category", "page_subtype",
@@ -130,6 +146,152 @@ def apply_validation(pages: pd.DataFrame,
 
 
 # --------------------------------------------------------------------------- #
+# Content-aware reclassification (rescue false 'unrelated' from the cache)
+# --------------------------------------------------------------------------- #
+_RECLASSIFY_COLUMNS = ["page_id", "url", "page_category", "page_subtype",
+                       "skincare_relevance", "new_category", "new_subtype",
+                       "new_funnel", "new_relevance", "content_source"]
+
+
+def _resolve_html_path(raw: str, cfg: ScrapeConfig) -> str:
+    """Locate a row's cached fetch JSON, tolerating paths written on another
+    OS or from another working directory: the parquet may carry
+    ``outputs/scrape_cache\\ab12….json`` (Windows separators) while we read it
+    on POSIX, or the cache may have moved with ``cache_dir``. Tries the stored
+    path, its separator-normalized forms, and the basename inside
+    ``cfg.cache_dir``. Returns "" when nothing exists."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+    cands = [raw, raw.replace("\\", os.sep), raw.replace("\\", "/")]
+    base = re.split(r"[\\/]", raw)[-1]
+    if base:
+        cands.append(os.path.join(cfg.cache_dir, base))
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return ""
+
+
+def _content_for_row(row: dict, cfg: ScrapeConfig) -> Tuple[PageContent, str, str]:
+    """Rebuild ``(PageContent, content_scope, content_source)`` for one stored
+    page row. Prefers the raw HTML in the fetch cache (``html_path``) — the
+    identical input the live pipeline saw. Falls back to reassembling a thin
+    PageContent from the stored columns (title / meta / h1 / text excerpt /
+    schema types), which is all the keyword scorer and most markup votes need;
+    rows with neither reclassify from the URL alone (scope "none")."""
+    url = str(row.get("url") or "")
+    path = _resolve_html_path(row.get("html_path"), cfg)
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                blob = json.load(fh)
+            html = blob.get("html") or ""
+            if html:
+                return (extract_page(html, url, parser=cfg.html_parser),
+                        str(row.get("fetch_scope") or "page"), "cache")
+        except Exception:
+            pass
+    title = str(row.get("title") or "")
+    text = str(row.get("text_excerpt") or "")
+    if not (title or text):
+        return PageContent(url=url), "none", "url"
+    types = row.get("schema_types")
+    if types is None or isinstance(types, float):
+        types = []
+    types = [str(t) for t in list(types) if str(t)]
+    og = {k: v for k, v in (("og:type", str(row.get("og_type") or "")),
+                            ("og:site_name", str(row.get("og_site_name") or ""))) if v}
+    pc = PageContent(
+        url=url, title=title, text=text,
+        meta_description=str(row.get("meta_description") or ""),
+        h1=[str(row.get("h1"))] if str(row.get("h1") or "") else [],
+        og=og, jsonld=[{"@type": types}] if types else [],
+    )
+    return pc, str(row.get("fetch_scope") or "page"), "row"
+
+
+def reclassify_pages(pages: pd.DataFrame,
+                     cfg: Optional[ScrapeConfig] = None
+                     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Re-run the content-aware classifier over stored ``unrelated`` /
+    ``unknown`` rows and rescue the false negatives. Returns
+    ``(repaired copy of pages, report of what changed)``.
+
+    Built for vocabulary updates: page labels are computed once at scrape time,
+    and ``resume`` never revisits them — so a widened relevance lexicon needs
+    this pass to reach existing parquets. Nothing is fetched: content comes
+    from the cache file each row's ``html_path`` points at, or the stored
+    excerpt columns. The stored vendor prior (``prior_*`` columns) and product
+    count feed the classifier exactly as live; chat brands are deliberately
+    NOT replayed from ``brand_detected`` (that column mixes in page brands —
+    replaying it would let a page vouch for itself).
+
+    Repairs are **rescue-only** — applied when the fresh verdict is
+    study-relevant with a real category while the stored row said
+    ``unrelated``/``unknown``. Rescued rows take the new category / subtype /
+    funnel stage / relevance (and seller when learned), get ``+reclassified``
+    on ``classifier_method`` and ``reclassified`` in
+    ``classification_signals`` — same audit contract as
+    :func:`apply_validation`."""
+    cfg = cfg or ScrapeConfig()
+    report_rows = []
+    if pages is None or pages.empty or "url" not in pages.columns:
+        return pages, pd.DataFrame(columns=_RECLASSIFY_COLUMNS)
+    fixed = pages.copy()
+    for idx in fixed.index:
+        row = fixed.loc[idx].to_dict()
+        stored_cat = str(row.get("page_category") or "")
+        if stored_cat not in ("unrelated", "unknown"):
+            continue
+        url = str(row.get("url") or "")
+        if not url:
+            continue
+        page, scope, source = _content_for_row(row, cfg)
+        prior = {cfg.col_page_type: str(row.get("prior_page_type") or ""),
+                 cfg.col_seller_type: str(row.get("prior_seller_type") or ""),
+                 cfg.col_retailer_brand: str(row.get("prior_retailer_brand") or ""),
+                 cfg.col_site_category: str(row.get("prior_site_category") or "")}
+        prior = {k: v for k, v in prior.items() if v}
+        n_products = row.get("n_products")
+        n_products = int(n_products) if n_products is not None and not pd.isna(n_products) else 0
+        entry = lookup(url, cfg.directory_path) if cfg.directory_fallback else None
+        v = classify_page(page, url, cfg, prior=prior or None,
+                          n_products=n_products, directory_entry=entry,
+                          content_scope=scope)
+        rescued = v.page_category not in ("unrelated", "unknown") and v.is_study_relevant
+        if not rescued:
+            continue
+        fixed.at[idx, "page_category"] = v.page_category
+        fixed.at[idx, "page_subtype"] = v.page_subtype
+        fixed.at[idx, "funnel_stage"] = v.funnel_stage
+        fixed.at[idx, "skincare_relevance"] = float(v.skincare_relevance)
+        fixed.at[idx, "is_study_relevant"] = bool(v.is_study_relevant)
+        if v.seller_type != "na" and "seller_type" in fixed.columns:
+            fixed.at[idx, "seller_type"] = v.seller_type
+        if "classifier_method" in fixed.columns:
+            m = str(fixed.at[idx, "classifier_method"] or "rule")
+            if "reclassified" not in m:
+                fixed.at[idx, "classifier_method"] = m + "+reclassified"
+        if "classification_signals" in fixed.columns:
+            sig = fixed.at[idx, "classification_signals"]
+            sig = list(sig) if sig is not None and not isinstance(sig, float) else []
+            if "reclassified" not in sig:
+                fixed.at[idx, "classification_signals"] = sig + ["reclassified"]
+        report_rows.append({
+            "page_id": str(row.get("page_id") or ""), "url": url,
+            "page_category": stored_cat,
+            "page_subtype": str(row.get("page_subtype") or ""),
+            "skincare_relevance": float(row.get("skincare_relevance") or 0.0),
+            "new_category": v.page_category, "new_subtype": v.page_subtype,
+            "new_funnel": v.funnel_stage,
+            "new_relevance": float(v.skincare_relevance),
+            "content_source": source,
+        })
+    return fixed, pd.DataFrame(report_rows, columns=_RECLASSIFY_COLUMNS)
+
+
+# --------------------------------------------------------------------------- #
 # Writing back with the pinned schema
 # --------------------------------------------------------------------------- #
 def _coerce_rows(pages: pd.DataFrame) -> list:
@@ -171,9 +333,44 @@ def _main(argv=None) -> None:
                     help="write the repaired table back to the same file")
     ap.add_argument("--out", default=None,
                     help="write the repaired table to this path instead")
+    ap.add_argument("--reclassify", action="store_true",
+                    help="content-aware pass instead of URL-only: re-run the "
+                         "classifier on stored unrelated/unknown rows from the "
+                         "cached HTML (html_path) and rescue false negatives — "
+                         "use after a relevance-vocabulary update")
+    ap.add_argument("--cache-dir", default=None,
+                    help="where the fetch cache lives if not the configured "
+                         "default (outputs/scrape_cache)")
     a = ap.parse_args(argv)
 
     pages = pd.read_parquet(a.pages)
+
+    if a.reclassify:
+        cfg = ScrapeConfig()
+        if a.cache_dir:
+            cfg.cache_dir = a.cache_dir
+        fixed, report = reclassify_pages(pages, cfg)
+        if report.empty:
+            print(f"[reclassify] {len(pages)} pages — nothing to rescue")
+            return
+        n_pool = int((pages["page_category"].isin(["unrelated", "unknown"])).sum())
+        print(f"[reclassify] rescued {len(report)} of {n_pool} "
+              f"unrelated/unknown rows ({len(pages)} total):")
+        summary = (report.groupby(["page_category", "new_category",
+                                   "new_subtype", "content_source"])
+                   .size().rename("n").reset_index())
+        print(summary.to_string(index=False))
+        print("\nexamples:")
+        print(report[["url", "page_category", "skincare_relevance",
+                      "new_category", "new_relevance"]].head(10).to_string(index=False))
+        if a.apply or a.out:
+            out = a.out or a.pages
+            write_pages(fixed, out)
+            print(f"\n[reclassify] repaired {len(report)} rows -> {out}")
+        else:
+            print("\nre-run with --apply (in place) or --out PATH to repair these rows")
+        return
+
     report = validation_report(pages)
     if report.empty:
         print(f"[validate] {len(pages)} pages — all labels agree with the URL rules")

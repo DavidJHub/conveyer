@@ -112,6 +112,12 @@ class ScrapeConfig:
     llm_model: str = "claude-opus-4-8"   # override via ANTHROPIC_MODEL
     llm_max_tokens: int = 400
     min_confidence: float = 0.0          # below this, fall back to 'unknown'
+    extra_relevance_terms: Tuple[str, ...] = ()
+                                         # extend the beauty/personal-care
+                                         # relevance vocabulary without editing
+                                         # code: plain case-insensitive phrases
+                                         # ("beard oil",), matched whole-word in
+                                         # page text AND URL slugs
 
     # --- Product <-> chat matching ------------------------------------------ #
     match_name_threshold: float = 0.34   # token-overlap cutoff for a name match

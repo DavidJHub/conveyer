@@ -605,6 +605,132 @@ def test_validate_repairs_unrelated_cart():
 
 
 # --------------------------------------------------------------------------- #
+# Relevance vocabulary: beauty/personal-care umbrella (the jbca.com haircare
+# PDP scored skincare_relevance 0.0 under the skincare-only list and collapsed
+# to 'unrelated' despite perfect pdp structure)
+# --------------------------------------------------------------------------- #
+HAIR_HTML = """<!doctype html><html lang="en"><head>
+<title>Thickening Strengthening &amp; Restorative Conditioner - JBCA Cosmetics</title>
+<meta name="description" content="Shop restorative thickening conditioner formulated to nourish, strengthen, and revive weakened hair.">
+<script type="application/ld+json">{"@type":"ProductGroup","name":"Thickening Strengthening & Restorative Conditioner","offers":{"lowPrice":6.99,"highPrice":49.99,"priceCurrency":"USD"}}</script>
+</head><body><h1>Thickening Strengthening &amp; Restorative Conditioner</h1>
+<p>Shop by Category: Shampoos Conditioners Hair Masks Hair Styling Products.
+Shop by Concern: Curl Definition Scalp Care. Fights dandruff, controls frizz, for curly hair.</p>
+<p>$6.99 - $49.99. Salon Quality. Sulfate Free. Cruelty Free.</p>
+<button>Add to cart</button></body></html>"""
+
+HVAC_HTML = """<!doctype html><html lang="en"><head><title>Arctic 8000 BTU Portable Air Conditioner</title>
+<meta name="description" content="This portable air conditioner cools rooms up to 350 sq ft.">
+<script type="application/ld+json">{"@type":"Product","name":"Arctic 8000 Portable Air Conditioner","offers":{"price":329,"priceCurrency":"USD"}}</script>
+</head><body><h1>Arctic 8000 Portable Air Conditioner</h1>
+<p>The air-conditioner ships with a remote. Quiet air conditioner for bedrooms. $329. Add to cart.</p></body></html>"""
+
+
+def test_haircare_pdp_is_relevant():
+    """A haircare PDP on an unknown brand domain must classify shopping/pdp
+    and be study-relevant — beauty/personal care is the topical umbrella, not
+    skincare alone. An HVAC 'air conditioner' PDP must NOT ride along."""
+    cfg = ScrapeConfig()
+    url = "https://www.jbca.com/products/thickening-strengthening-restorative-conditioner"
+    r = classify_rule(extract_page(HAIR_HTML, url), url, cfg, n_products=1)
+    _check(r.page_category == "shopping", f"haircare PDP -> {r.page_category}")
+    _check(r.page_subtype == "pdp" and r.funnel_stage == "Intent",
+           f"{r.page_subtype}/{r.funnel_stage}")
+    _check(r.skincare_relevance >= 0.5, f"relevance {r.skincare_relevance}")
+    _check(r.is_study_relevant, "haircare is inside the study umbrella")
+    # URL slug alone (unfetchable page) already carries the topic
+    bare = classify_rule(extract_page("", url), url, cfg)
+    _check(bare.is_study_relevant, f"slug-only relevance {bare.skincare_relevance}")
+    # the lookbehind guard: 'air conditioner' / 'air-conditioner' earn nothing
+    hvac_url = "https://coolhome.example/products/arctic-8000-portable-air-conditioner"
+    h = classify_rule(extract_page(HVAC_HTML, hvac_url), hvac_url, cfg, n_products=1)
+    _check(h.page_category == "unrelated", f"HVAC PDP -> {h.page_category}")
+    _check(h.skincare_relevance < 0.15, f"HVAC relevance {h.skincare_relevance}")
+
+
+def test_extra_relevance_terms_extend_vocabulary():
+    """ScrapeConfig.extra_relevance_terms widens the topical umbrella per run
+    without code edits — plain phrases, whole-word, flexible whitespace."""
+    url = "https://groomedman.example/products/cedar-beard-oil"
+    html = ('<html><head><title>Cedarwood Beard Oil</title>'
+            '<script type="application/ld+json">{"@type":"Product","name":"Cedar Beard Oil",'
+            '"offers":{"price":19,"priceCurrency":"USD"}}</script></head>'
+            '<body><h1>Cedarwood Beard Oil</h1><p>Softens and tames. $19. Add to cart.</p></body></html>')
+    base = classify_rule(extract_page(html, url), url, ScrapeConfig(), n_products=1)
+    _check(base.page_category == "unrelated", f"default vocabulary -> {base.page_category}")
+    cfg = ScrapeConfig(extra_relevance_terms=("beard oil",))
+    ext = classify_rule(extract_page(html, url), url, cfg, n_products=1)
+    _check(ext.page_category == "shopping" and ext.is_study_relevant,
+           f"extended vocabulary -> {ext.page_category}, rel {ext.skincare_relevance}")
+
+
+def test_reclassify_rescues_stale_unrelated():
+    """After a vocabulary update, reclassify_pages must rescue stored
+    'unrelated' rows from the cached HTML their html_path points at (even a
+    Windows-style path written on another machine) or from the stored excerpt
+    columns — and must leave genuinely off-topic rows untouched."""
+    from conveyer.scraping.validate import reclassify_pages, write_pages
+    out = tempfile.mkdtemp(prefix="conveyer_reclass_")
+    try:
+        cache = os.path.join(out, "cache")
+        os.makedirs(cache)
+        with open(os.path.join(cache, "hair01.json"), "w", encoding="utf-8") as fh:
+            json.dump({"http_status": 200, "html": HAIR_HTML}, fh)
+        with open(os.path.join(cache, "hvac01.json"), "w", encoding="utf-8") as fh:
+            json.dump({"http_status": 200, "html": HVAC_HTML}, fh)
+        common = dict(page_category="unrelated", page_subtype="pdp",
+                      funnel_stage="Irrelevant", seller_type="na",
+                      skincare_relevance=0.0, is_study_relevant=False,
+                      classifier_method="rule", fetch_scope="page", n_products=1)
+        pages = pd.DataFrame([
+            # rescued from cache, via a foreign-OS relative path
+            dict(common, page_id="p1",
+                 url="https://www.jbca.com/products/thickening-strengthening-restorative-conditioner",
+                 html_path="outputs\\scrape_cache\\hair01.json",
+                 classification_signals=[["url", "markup"]][0],
+                 title="", text_excerpt=""),
+            # genuinely off-topic: must NOT be rescued
+            dict(common, page_id="p2",
+                 url="https://coolhome.example/products/arctic-8000-portable-air-conditioner",
+                 html_path="outputs\\scrape_cache\\hvac01.json",
+                 classification_signals=[["url", "markup"]][0],
+                 title="", text_excerpt=""),
+            # no cache file at all: rescued from the stored excerpt columns
+            dict(common, page_id="p3",
+                 url="https://brandx.example/products/repair-shampoo",
+                 html_path="", classification_signals=[["url"]][0],
+                 title="Repair Shampoo for damaged hair",
+                 text_excerpt="Sulfate free shampoo and conditioner for dry scalp. $12. Add to cart."),
+        ])
+        cfg = ScrapeConfig(cache_dir=cache)
+        fixed, report = reclassify_pages(pages, cfg)
+        _check(len(report) == 2, f"rescued rows: {report['page_id'].tolist() if not report.empty else []}")
+        by_id = fixed.set_index("page_id")
+        _check(by_id.loc["p1", "page_category"] == "shopping"
+               and by_id.loc["p1", "funnel_stage"] == "Intent",
+               f"p1 -> {by_id.loc['p1', 'page_category']}")
+        _check(float(by_id.loc["p1", "skincare_relevance"]) >= 0.5, "p1 relevance updated")
+        _check("reclassified" in list(by_id.loc["p1", "classification_signals"]),
+               "rescue audited in signals")
+        _check("+reclassified" in str(by_id.loc["p1", "classifier_method"]), "method audited")
+        _check(by_id.loc["p2", "page_category"] == "unrelated"
+               and "reclassified" not in list(by_id.loc["p2", "classification_signals"]),
+               "true off-topic row untouched")
+        _check(by_id.loc["p3", "page_category"] == "shopping",
+               f"excerpt-column fallback -> {by_id.loc['p3', 'page_category']}")
+        src = report.set_index("page_id")["content_source"]
+        _check(src["p1"] == "cache" and src["p3"] == "row", f"sources {src.to_dict()}")
+        # rescued frame must round-trip through the pinned parquet schema
+        path = os.path.join(out, "rescued.parquet")
+        write_pages(fixed, path)
+        back = pd.read_parquet(path)
+        _check(back.set_index("page_id").loc["p1", "page_category"] == "shopping",
+               "parquet round-trip keeps the rescue")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
 # Incremental persistence & resume
 # --------------------------------------------------------------------------- #
 def test_incremental_jsonl_and_resume():

@@ -33,15 +33,15 @@ rules that respect what each modality can know:
 
 * **topic-neutral subtypes** (cart, checkout, order, search results,
   marketplace and storefront homepages) carry no topical tokens *by nature* —
-  journey infrastructure, never collapsed for lacking skincare evidence. But
+  journey infrastructure, never collapsed for lacking topical evidence. But
   neutrality must be *earned* by a structural vote (URL/markup/prior or a
   decisive domain role): the weak retailer catch-all does not turn
   ``sephora.com/careers`` into a journey page, and a SERP whose URL exposes
   its query is judged by the query text instead;
 * **transactional URL tokens are self-evident commerce** on any domain — an
   unfetchable ``/checkouts/c/<token>`` on an unheard-of store is a checkout;
-* **topical subtypes** (PDP, article, …) *with* fetched content and no skincare
-  signal collapse to ``unrelated`` (a confident judgement);
+* **topical subtypes** (PDP, article, …) *with* fetched content and no beauty /
+  personal-care signal collapse to ``unrelated`` (a confident judgement);
 * topical subtypes *without* content keep their *earned* structural category
   when the domain is a known one (an unfetched ``amazon.com/dp/…`` is still a
   shopping page — for *which* product is what ``is_study_relevant`` tracks),
@@ -53,7 +53,8 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional
+from functools import lru_cache
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:  # runtime-free: directory.py imports classify, not vice versa
@@ -115,13 +116,56 @@ _MULTI_TLD = {
     "co.kr", "com.tr", "co.za", "com.sg", "com.hk", "co.il",
 }
 
-_SKINCARE_KEYWORDS = re.compile(
-    r"\b(skin ?care|skincare|serum|moisturi[sz]er|cleanser|sunscreen|spf|retinol|"
-    r"niacinamide|hyaluronic|salicylic|glycolic|vitamin c|ceramide|toner|"
-    r"exfoliant|acne|blackheads|wrinkles|dark spots|hyperpigmentation|dermatolog|"
-    r"pore|breakout|rosacea|eczema|face ?cream|eye ?cream|peptide|azelaic)\b",
+# Topical relevance vocabulary. The study's umbrella is **beauty / personal
+# care**, not skincare alone: the corpus routinely surfaces haircare, bodycare
+# and cosmetics PDPs (a thickening conditioner is as on-topic as a retinol
+# serum — the jbca.com counterexample scored 0.0 under the skincare-only list
+# and collapsed to 'unrelated'). One hit already clears the relevance bar, so
+# every term must be unambiguous on its own: common polysemes stay out —
+# "foundation" (charity), "powder" (snow), "primer" (paint), "blush" (verb),
+# "curl" (bicep), "cologne" (the city), "soap" (opera), bare "cosmetic"
+# (superficial change), bare "beauty" (figurative) — compounds carry those
+# meanings instead (curl cream, beauty routine, cosmetics). Extend per-run
+# without editing code via ``ScrapeConfig.extra_relevance_terms``.
+_RELEVANCE_KEYWORDS = re.compile(
+    r"\b("
+    # skincare (the original core)
+    r"skin ?care|serums?|moisturi[sz]ers?|cleansers?|sunscreen|spf|retinol|"
+    r"niacinamide|hyaluronic|salicylic|glycolic|vitamin c|ceramides?|toners?|"
+    r"exfoliants?|acne|blackheads?|wrinkles?|dark spots?|hyperpigmentation|"
+    r"dermatolog\w*|pores?|breakouts?|rosacea|eczema|face ?creams?|"
+    r"eye ?creams?|peptides?|azelaic|anti[- ]ag(?:e?ing)|"
+    # haircare ("air conditioner" / "air-conditioner" must not count)
+    r"hair ?care|shampoos?|(?<!air )(?<!air-)conditioners?|"
+    r"hair (?:masks?|oils?|serums?|sprays?|gels?|dyes?|loss|growth|types?|"
+    r"routines?|styling)|scalp|dandruff|frizz|split ends|heat protectants?|"
+    r"leave[- ]in|keratin|curl (?:creams?|defin\w*)|curly hair|"
+    r"salon[- ]quality|"
+    # body / personal care
+    r"body ?care|personal care|body (?:wash(?:es)?|lotions?|butters?|scrubs?|"
+    r"oils?)|hand creams?|lip balms?|deodorants?|antiperspirants?|"
+    r"shower gels?|(?:sulfate|paraben|cruelty)[- ]free|shea butter|argan|"
+    r"jojoba|aloe vera|"
+    # cosmetics / fragrance ("makeup" one word only — "make up" is a verb)
+    r"cosmetics|makeup|mascara|lipsticks?|lip gloss|eyeliners?|eyeshadows?|"
+    r"concealers?|bronzers?|nail polish|setting sprays?|fragrances?|perfumes?|"
+    r"eau de (?:parfum|toilette)|k[- ]beauty|"
+    r"beauty (?:products?|routines?|brands?|editors?|tips?|essentials?)"
+    r")\b",
     re.IGNORECASE,
 )
+
+
+@lru_cache(maxsize=32)
+def _extra_relevance_pattern(terms: Tuple[str, ...]) -> "Optional[re.Pattern]":
+    """User-supplied vocabulary extensions (``ScrapeConfig.extra_relevance_terms``):
+    plain case-insensitive phrases, matched whole-word with flexible internal
+    whitespace — no regex knowledge required to add "beard oil"."""
+    parts = [r"\s+".join(re.escape(w) for w in t.split())
+             for t in terms if t and t.strip()]
+    if not parts:
+        return None
+    return re.compile(r"\b(?:" + "|".join(parts) + r")\b", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- #
@@ -171,7 +215,8 @@ class PageClass:
     funnel_stage: str = "Irrelevant"
     confidence: float = 0.0
     method: str = "rule"               # rule | rule+prior | llm
-    skincare_relevance: float = 0.0
+    skincare_relevance: float = 0.0    # beauty/personal-care topical score
+                                       # (column name kept for schema stability)
     is_study_relevant: bool = False
     primary_brand: str = ""
     brand_detected: List[str] = field(default_factory=list)
@@ -382,14 +427,22 @@ def _markup_votes(page: PageContent, n_products: int) -> Dict[str, float]:
     return v
 
 
-def _skincare_relevance(page: PageContent, u: UrlParts, chat_brands: set,
-                        prior_category: str = "") -> float:
+def _topical_relevance(page: PageContent, u: UrlParts, chat_brands: set,
+                       prior_category: str = "",
+                       extra_terms: Tuple[str, ...] = ()) -> float:
+    """0–1 beauty / personal-care topical score. Stored in the
+    ``skincare_relevance`` column — the name is kept for schema stability
+    across existing parquets, but the vocabulary covers the whole umbrella
+    (skincare, haircare, bodycare, cosmetics) plus ``extra_terms``."""
     # URL slugs are evidence too — critical when the body couldn't be fetched:
     # /product/cerave-moisturizing-cream is on-topic even with zero HTML.
     url_text = re.sub(r"[-_+/=&?.]", " ", f"{u.path} {u.query}")
     text = " ".join([page.title, page.meta_description, " ".join(page.h1),
                      page.text[:3000], url_text])
-    hits = len(_SKINCARE_KEYWORDS.findall(text))
+    hits = len(_RELEVANCE_KEYWORDS.findall(text))
+    extra = _extra_relevance_pattern(tuple(extra_terms or ()))
+    if extra is not None:
+        hits += len(extra.findall(text))
     score = min(1.0, hits / 4.0)
     # Only a skincare brand's own storefront is topical by domain alone; a
     # retailer (amazon, target) sells everything, so its domain must not confer
@@ -478,8 +531,9 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     if not votes:
         return PageClass(page_category="unknown", page_subtype="other",
                          confidence=0.0, method="rule", signals=signals,
-                         skincare_relevance=_skincare_relevance(page, u, chat_brands,
-                                                                prior_cat))
+                         skincare_relevance=_topical_relevance(
+                             page, u, chat_brands, prior_cat,
+                             tuple(cfg.extra_relevance_terms or ())))
 
     subtype = max(votes, key=votes.get)
     # decisive transactional URL tokens win the subtype outright: prices and
@@ -496,7 +550,8 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
         cat_scores[category_for_subtype(sub)] = cat_scores.get(category_for_subtype(sub), 0.0) + w
     confidence = _softmax_conf(cat_scores)
 
-    relevance = _skincare_relevance(page, u, chat_brands, prior_cat)
+    relevance = _topical_relevance(page, u, chat_brands, prior_cat,
+                                   tuple(cfg.extra_relevance_terms or ()))
     profile_used = False
     if domain_profile:
         prof_rel = float(domain_profile.get("relevance", 0.0) or 0.0)

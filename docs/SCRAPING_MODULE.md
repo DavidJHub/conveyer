@@ -169,6 +169,12 @@ This is the heart of the module, and the most likely place you'll tune.
 * `funnel_stage` — Discovery / Evaluation / Intent / Purchase / …, mapped from
   the category+subtype in `taxonomy.py`;
 * `skincare_relevance` (0–1) and `is_study_relevant` — is this page on-topic?
+  The topical umbrella is **beauty / personal care** (skincare + haircare +
+  bodycare + cosmetics — a thickening conditioner counts as much as a retinol
+  serum; the column name predates the wider vocabulary). Every keyword must be
+  unambiguous at a single hit, so polysemes like *foundation*, *powder* or
+  bare *conditioner* after "air" stay out; add your own terms per run with
+  `ScrapeConfig(extra_relevance_terms=("beard oil",))`;
 * `confidence`, and `classification_signals` — *which evidence fired*.
 
 **How it decides: four independent "voters".** Each modality scores subtypes
@@ -366,7 +372,7 @@ six columns almost always explain it:
 |---|---|
 | `fetch_status` / `fetch_error` / `http_status` | Did we even get the page? (`error` + HTTP 403 = bot wall) |
 | `fetch_scope` | Did the label come from the page (`page`), the homepage stand-in (`base`), the domain directory's description (`directory`), or the URL alone (`none`)? |
-| `classification_signals` | Which voters fired: `url` / `domain` / `markup` / `prior` / `content` / `base_content` / `directory` / `directory_content` / `llm`; audit markers: `url_override` (transactional URL beat the markup vote), `url_validated` (repaired by the validate tool) |
+| `classification_signals` | Which voters fired: `url` / `domain` / `markup` / `prior` / `content` / `base_content` / `directory` / `directory_content` / `llm`; audit markers: `url_override` (transactional URL beat the markup vote), `url_validated` (repaired by the validate tool), `reclassified` (rescued by the content-aware `--reclassify` pass) |
 | `classifier_method` | `rule`, `rule+prior`, or `llm` |
 | `page_category_confidence` | How decisive the vote was (softmax) |
 | `extraction_source` (products) | jsonld / opengraph / microdata / heuristic |
@@ -415,6 +421,26 @@ proxy). Repairs are audited: `classifier_method` gains `+url_validated` and
 the signal list gains `url_validated`. `run_scrape` also prints a
 `[validate]` summary at the end of every run, so this class of regression
 can't ship silently.
+
+**The content-aware rescue (`--reclassify`).** Labels are burned into the
+parquet at scrape time and `resume=True` never revisits a finished URL — so
+when the *relevance vocabulary* improves (e.g. widening skincare-only to all
+of beauty/personal care, which had left a haircare conditioner PDP marked
+`unrelated` with relevance 0.0), the fix must be applied retroactively:
+
+```bash
+python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet --reclassify           # report
+python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet --reclassify --apply   # rescue in place
+```
+
+It re-runs the full classifier over every stored `unrelated`/`unknown` row
+using the raw HTML the row's `html_path` points at in the fetch cache
+(`--cache-dir` if it moved; Windows-style stored paths resolve fine on any
+OS), falling back to the stored title/excerpt columns — **nothing is
+re-fetched**. Repairs are rescue-only: a row changes only when the fresh
+verdict is study-relevant with a real category; genuinely off-topic rows are
+never touched. Rescued rows gain `+reclassified` / `reclassified` audit
+marks, same contract as the URL check.
 
 Also useful: the JSONL sidecars in `outputs/scrape/` are human-readable —
 `tail -f scraped_pages.jsonl` during a run shows live progress; the cache in

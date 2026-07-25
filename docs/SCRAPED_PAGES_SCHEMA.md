@@ -201,9 +201,9 @@ erDiagram
 | `page_category_confidence` | float64 | softmax over category-level rule scores, 0–1 |
 | `seller_type` | string | `brand_owned · retailer · na` |
 | `funnel_stage` | string | Awareness … Post-Purchase / Irrelevant |
-| `classifier_method` | string | `rule · rule+prior · llm · error` |
-| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · base_content · domain_profile · prior · llm` |
-| `skincare_relevance` | float64 | 0–1 topical score (keywords + brands, in content **and** URL slugs) |
+| `classifier_method` | string | `rule · rule+prior · llm · error`, plus repair suffixes `+url_validated` / `+reclassified` when a later pass fixed the row |
+| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · base_content · directory · domain_profile · prior · llm · url_override · url_validated · reclassified` |
+| `skincare_relevance` | float64 | 0–1 **beauty / personal-care** topical score — skincare, haircare, bodycare and cosmetics keywords + brands, in content **and** URL slugs. The column name predates the wider vocabulary and is kept for schema stability; extend the lexicon per run via `ScrapeConfig.extra_relevance_terms` |
 | `is_study_relevant` | bool | `skincare_relevance ≥ 0.15`, or journey infrastructure (topic-neutral subtype on a known domain) |
 | `primary_brand` | string | page-intrinsic brand (brand domain or `product:brand`) |
 | `brand_detected` | list\<string\> | page brand ∪ brands the chat mentioned on linked turns |

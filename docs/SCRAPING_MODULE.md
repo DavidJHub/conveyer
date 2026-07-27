@@ -71,13 +71,33 @@ filter the list here.
 | Behaviour | Setting | Default |
 |---|---|---|
 | Obey `robots.txt` (the file where sites say what bots may visit) | `respect_robots` | on |
-| Identify honestly | `user_agent` | research-bot string |
+| Present a realistic browser header profile | `browser_headers` | on |
 | Max 1 request per second per domain | `rate_limit_per_domain` | 1.0 s |
 | Retry transient failures, doubling the wait | `max_retries`, `retry_backoff` | 2 retries, 2 s |
 | Give up on any URL after a wall-clock cap | `hard_timeout` | 30 s |
 | Stop reading bodies past a size cap | `max_bytes` | 2 MB |
 | Only accept HTML | `allowed_content_types` | text/html |
 | Save every fetch to disk, never re-hit a site | `cache_dir`, `use_cache` | on |
+
+**Bot walls: don't hammer, salvage everything.** Many CDNs 403 unknown
+user-agent strings before the origin ever sees the request, so by default the
+fetcher presents a normal desktop-browser header profile
+(`browser_headers=True`; set it off to send the descriptive
+`user_agent` bot string instead). This changes *presentation only* —
+robots.txt, the per-domain rate limit, the circuit breaker and the wall-clock
+cap all still apply. When a wall does fire:
+
+* **401/403/406/451 are never retried** — a wall answers the same way every
+  time; the result is `fetch_status="blocked"` and the domain's circuit
+  breaker counts it, so a fully walled domain stops being contacted;
+* **429 honors `Retry-After`** once, when it fits the wall-clock budget;
+* **everything the response DID give us is kept**: the response headers
+  (`response_headers` column, also captured on OK fetches) and a bounded
+  error-body excerpt. The headers alone often fingerprint the platform
+  (`server_platform` column — `x-shopify-stage` ⇒ Shopify), which feeds the
+  classifier's platform channel: a bot-walled Shopify store's `/products/…`
+  URL still classifies `shopping · pdp · brand_owned`. The error body is
+  used **only** for fingerprinting — it never masquerades as page content.
 
 **What it uses.** The **`requests`** library (the standard Python HTTP
 client) for downloads; **`concurrent.futures.ThreadPoolExecutor`** (standard
@@ -101,8 +121,10 @@ notebooks with no connectivity.
 
 **Troubleshooting.** Every outcome is recorded on the page row:
 `fetch_status` (`ok` / `cached` / `error` / `skipped` / `offline_miss` /
-`robots_blocked`), `http_status`, `fetch_error`. Start any debugging session
-with `pages.fetch_status.value_counts()`.
+`robots_blocked` / `blocked` / `circuit_open`), `http_status`,
+`fetch_error`, plus the salvage columns `response_headers` and
+`server_platform`. Start any debugging session with
+`pages.fetch_status.value_counts()`.
 
 ### Step 3 — Parse the HTML (`extract.py`)
 
@@ -177,19 +199,37 @@ This is the heart of the module, and the most likely place you'll tune.
   `ScrapeConfig(extra_relevance_terms=("beard oil",))`;
 * `confidence`, and `classification_signals` — *which evidence fired*.
 
-**How it decides: four independent "voters".** Each modality scores subtypes
+**How it decides: independent "voters".** Each modality scores subtypes
 with hand-set weights; votes are summed; the highest-scoring subtype wins.
 
 | Voter | Evidence | Example | Tech |
 |---|---|---|---|
 | **URL structure** | tokens in path/query | `/cart` → cart (2.5), `/dp/` → pdp (2.0), `?q=` → serp (2.0) | regex |
+| **Service routing** | subdomain + first path segment on multi-service platforms | `docs.google.com` → tool, `maps.google.*` → local, `shopping.google.*` → marketplace, `facebook.com/marketplace` → marketplace (deep item pages demote to `listing`, so fetched off-topic listings still collapse) | `_PLATFORM_SERVICES` table; **replaces** the generic domain vote; an unrecognized Google surface gets *no* domain opinion instead of a false "search"; two-letter locale subdomains (`cn.bing.com`) stay transparent |
 | **Domain knowledge** | registrable domain vs curated lists | `amazon.*` → retailer, `reddit.*` → community, `cerave.com` → brand site | Python sets in `classify.py` + the shared brand lexicon `conveyer/brands.py` |
 | **Page markup** | schema.org types, og:type, price/add-to-cart, product count | `@type: Product` → pdp; ≥3 products → collection | reads `PageContent` |
 | **Vendor prior** | SimilarWeb's own `page_type` label | `page_type=checkout` → +1.5 to checkout | weight `3.0 × prior_weight (0.5)` |
-| **Domain directory** | the directory entry's role, for domains the curated lists don't know | external-file entry `role: retailer` → same votes a curated retailer gets | `directory.py`; only speaks when the domain lists are silent |
+| **Domain directory** | the directory entry's role, for domains the curated lists don't know | external-file entry `role: retailer` → same votes a curated retailer gets | `directory.py`; only speaks when the platform table and domain lists are silent |
+| **Platform fingerprint** | response headers / markup identify the commerce platform | `x-shopify-stage` header → storefront corroboration + `seller_type=brand_owned` hint — works **even on a 403**, and the domain profile remembers it after the circuit opens | `fingerprint.py`; deliberately below the decisive bar; **structural evidence only** — it keeps an unfetchable `/products/…` in `shopping`, but never makes an off-topic store study-relevant, and it is suppressed on curated retailer domains (credobeauty runs Shopify but stays a retailer) |
+| **Learned model** | self-trained multinomial logistic over hashed URL/markup/text features | `model_weight (2.0) × probability` for the top subtypes | `model.py`; autotrains on synthetic ground truth, self-trains on your parquet: `python -m conveyer.scraping.model train --pages …` |
 
 Confidence is a **softmax** over the summed category scores — roughly "how
 much did the winner beat the runners-up".
+
+The service table also adds three subtypes to the taxonomy: `local` (maps /
+places → reference), `tool` (docs/drive/mail/cloud consoles → unrelated) and
+`account` (sign-in walls → unrelated) — these were the URLs that previously
+all collapsed into "search" just because the domain was `google.com`.
+
+**The learned model** predicts the structural subtype only (topical relevance
+stays its own axis), persists as a plain `.npz` (numpy-only inference), and
+votes below the decisive rule weights — it tips ties, it cannot overrule a
+`/cart/` path. Standalone it cross-validates at ~0.73 on the seed training
+frame (495 samples); its value grows with self-training:
+`python -m conveyer.scraping.model train --pages outputs/scrape/scraped_pages.parquet`
+absorbs your real corpus's confident rows as weak labels, and
+`python -m conveyer.scraping.model eval` prints the per-subtype
+precision/recall table. Disable with `use_learned_model=False`.
 
 **One veto rule: decisive transactional URL tokens win outright.** A page
 under `/cart/`, `/checkouts/`, `/gp/cart`, `/order-history` *is* that page no
@@ -258,28 +298,57 @@ verdict is shaky, optionally ask an expensive expert (the LLM).
 
 **What it does.** For each product found on a page, compares it against every
 product the agent mentioned on the turn(s) that surfaced this URL, and keeps
-the best match:
+the best match — **precision-first, in tiers** (`match_strength`):
 
-| Test | Score | Meaning |
+| Tier | Reached by | May coincide? |
 |---|---|---|
-| **SKU** exact match | 1.0 | same identifier — certain |
-| **Brand** match (normalized set/substring) | 0.75 + 0.25 × name-overlap | same brand, better if name agrees too |
-| **Name** token overlap ≥ 0.34 | 0.4 + 0.5 × overlap | similar wording |
-| **Category** token intersection | 0.3 | weak corroboration only |
+| **exact** | SKU identity; or brand agreement + near-identical name | ✔ |
+| **strong** | brand agreement + **name** corroboration (core-token containment ≥ 0.34 or char-trigram ≥ 0.45); or, with no brand info, a near-identical multi-token name (containment ≥ 0.85 / trigram ≥ 0.7) | ✔ |
+| **likely** | brand alone; brand + only a shared form/category word (an Eye Repair Cream is not the Moisturizing Cream); moderate name similarity alone | ✘ |
+| **none** | nothing meaningful | ✘ |
 
-`coincides = match_score ≥ coincide_threshold (0.5)` — so in practice a
-SKU or brand match, or a strong name match. Name overlap is **Jaccard
-similarity**: shared words ÷ total distinct words, after lowercasing and
-dropping stop-words (`the`, `for`, `skincare`, `oz`, …).
+Name evidence is measured on the name's **core tokens** (brand words
+excluded from the ratio, sizes stripped) and requires at least two of them —
+a bare "Moisturizer" identifies nothing. Attribute/category agreement raises
+the score but never substitutes for the name.
 
-**What it uses.** Pure Python set operations + the shared `normalize()`
-helper (lowercase/trim) from `conveyer/ingest.py`. Deliberately simple —
-no fuzzy-matching library, no embeddings (yet; see §5).
+`coincides` requires **exact or strong** *and* `match_score ≥
+coincide_threshold` — the same brand is *not* the same product (the old
+scorer's 0.75-for-brand-alone made a CeraVe cleanser "coincide" with a CeraVe
+moisturizer mention). Two **veto rules** cap any match at `likely` no matter
+how similar the names read:
+
+* **brand conflict** — the page product's brand disagrees with the mention's
+  ("Cetaphil Moisturizing Cream" vs a CeraVe mention);
+* **attribute conflict** — identity-bearing attributes disagree: SPF numbers
+  (SPF 30 ≠ SPF 60) and product-form words (a *lotion* is not the *cream*).
+  Sizes and counts ("19 oz", "2-pack") are stripped first — packaging, not
+  identity.
+
+Brand agreement itself has three routes, so long-tail brands connect too:
+the shared lexicon (`conveyer/brands.py`), fuzzy string identity
+(char-trigram ≥ 0.72), or the product brand's **distinctive token appearing
+in the mention's entity text** — that last one links a `JBCA` conditioner PDP
+to a turn that recommended "the JBCA thickening conditioner" even though no
+lexicon knows the brand. Character trigrams also make names typo-robust
+("CereVe Moisturising Cream" still matches). Every verdict records *which*
+evidence fired in `match_signals`.
+
+The page row carries the roll-up: `chat_match_strength` / `chat_match_score`
+= the best tier among the page's products vs the mentions of the turns that
+surfaced it — the page ↔ chat connection at the page grain, ready for the
+funnel model.
+
+**What it uses.** Pure Python set operations, char-trigram cosine, + the
+shared `normalize()` helper from `conveyer/ingest.py`. No fuzzy-matching
+library needed; the trigram channel covers what short-string embeddings
+would.
 
 **In plain terms.** The agent said "try the CeraVe Moisturizing Cream". The
 user lands on a page selling "CeraVe Moisturizing Cream 19 oz". Same barcode?
-Match. Same brand? Very likely match. Half the words in common? Probably.
-Only the category ("a moisturizer")? Too weak to call a coincidence.
+Match. Same brand *and* the name agrees? Match. Same brand but it's the lip
+balm? Noted as `likely`, **not** counted — and if the page says SPF 30 where
+the chat said SPF 60, that mismatch alone disqualifies it.
 
 ### Step 7 — Save everything, crash-proof (`schema.py` + `pipeline.py`)
 

@@ -113,11 +113,15 @@ collapse rules that respect what each modality can know:
 `page_subtype` (structural): `homepage · landing · brand_site · collection ·
 category · marketplace · listing · pdp · cart · checkout · order · wishlist ·
 article · review · listicle · serp · site_search · forum · social · qa · wiki ·
-health · howto · other`. The vendor's `page_type` maps onto these
-(`taxonomy.SIMILARWEB_PAGE_TYPE_TO_SUBTYPE`) and acts as a classifier prior.
-Funnel bumps: `cart`/`checkout` → Purchase and `order` → Post-Purchase, applied
-only to real `shopping` pages; `wishlist` stays Intent (saved-for-later is not
-a purchase event).
+health · howto · local · tool · account · other`. The vendor's `page_type`
+maps onto these (`taxonomy.SIMILARWEB_PAGE_TYPE_TO_SUBTYPE`) and acts as a
+classifier prior. Funnel bumps: `cart`/`checkout` → Purchase and `order` →
+Post-Purchase, applied only to real `shopping` pages; `wishlist` stays Intent
+(saved-for-later is not a purchase event). The last three come from
+**service-aware platform routing**: `local` = maps/places surfaces
+(→ reference), `tool` = productivity/utility services like docs.google.com
+(→ unrelated), `account` = sign-in walls (→ unrelated) — previously every
+`google.com` URL collapsed into `search` regardless of the service.
 
 ---
 
@@ -151,7 +155,7 @@ erDiagram
 
 ---
 
-## 3 · `fact_scraped_page` — 57 columns (grain = one URL)
+## 3 · `fact_scraped_page` — 61 columns (grain = one URL)
 
 ### Identity & URL parts
 
@@ -168,7 +172,7 @@ erDiagram
 
 | column | type | description |
 |---|---|---|
-| `fetch_status` | string | `ok · cached · error · skipped · offline_miss · robots_blocked · circuit_open` |
+| `fetch_status` | string | `ok · cached · error · skipped · offline_miss · robots_blocked · blocked · circuit_open` — `blocked` = a bot wall answered (401/403/406/451, or 429 past its Retry-After); never retried, headers still salvaged |
 | `http_status` | int32 (nullable) | HTTP code (null when never fetched) |
 | `content_type` | string | response content-type |
 | `fetched_at` | string | UTC ISO timestamp |
@@ -177,6 +181,8 @@ erDiagram
 | `fetch_scope` | string | where the content came from: `page` (the URL itself) · `base` (**base-URL fallback** — the deep link was unreachable, so `scheme://host/` was fetched instead and stands in for domain-level evidence; `x.com/…/status/…` → `x.com/`) · `directory` (**domain-directory fallback** — nothing was fetchable, the offline directory's description of the domain stands in) · `none` (URL/domain heuristics only) |
 | `parser` | string | `stdlib` or `bs4` (auto-upgrades when installed) · `directory` for directory stand-ins |
 | `html_path` | string | where the raw HTML used for this row lives on disk (the per-URL fetch-cache file; the base URL's file when `fetch_scope="base"`); empty when nothing was fetched or caching is off |
+| `response_headers` | string (JSON) | the response headers, captured on OK fetches **and** on blocks — "anything can be useful for the model" |
+| `server_platform` | string | hosting-platform fingerprint from headers/markup: `shopify · woocommerce · bigcommerce · magento · salesforce_commerce · wix · squarespace · cloudflare · …` (empty = none detected). Commerce platforms feed the classifier's platform channel and the `seller_type` hint |
 
 ### Extracted page info ("all the info of the web page we can")
 
@@ -202,11 +208,13 @@ erDiagram
 | `seller_type` | string | `brand_owned · retailer · na` |
 | `funnel_stage` | string | Awareness … Post-Purchase / Irrelevant |
 | `classifier_method` | string | `rule · rule+prior · llm · error`, plus repair suffixes `+url_validated` / `+reclassified` when a later pass fixed the row |
-| `classification_signals` | list\<string\> | modalities that fired: `url · domain · markup · content · base_content · directory · domain_profile · prior · llm · url_override · url_validated · reclassified` |
+| `classification_signals` | list\<string\> | modalities that fired: `url · service · domain · markup · platform · model · content · base_content · directory · domain_profile · prior · llm · url_override · url_validated · reclassified` |
 | `skincare_relevance` | float64 | 0–1 **beauty / personal-care** topical score — skincare, haircare, bodycare and cosmetics keywords + brands, in content **and** URL slugs. The column name predates the wider vocabulary and is kept for schema stability; extend the lexicon per run via `ScrapeConfig.extra_relevance_terms` |
 | `is_study_relevant` | bool | `skincare_relevance ≥ 0.15`, or journey infrastructure (topic-neutral subtype on a known domain) |
 | `primary_brand` | string | page-intrinsic brand (brand domain or `product:brand`) |
 | `brand_detected` | list\<string\> | page brand ∪ brands the chat mentioned on linked turns |
+| `chat_match_strength` | string | page ↔ chat product connection, rolled up from this page's product rows: best tier vs the surfacing turns' mentions — `exact · strong · likely · none` (only exact/strong count as a coincide; empty on rows written before this column existed) |
+| `chat_match_score` | float64 | the score behind that best tier |
 
 ### Provenance & vendor prior
 
@@ -222,7 +230,7 @@ erDiagram
 
 ---
 
-## 4 · `fact_scraped_product` — 26 columns (grain = one product on a page)
+## 4 · `fact_scraped_product` — 28 columns (grain = one product on a page)
 
 ### Extracted metadata (price, description, rating, category)
 
@@ -248,9 +256,11 @@ erDiagram
 | `matched_recommendation_id` | string | **FK → `fact_ai_recommendation`** best-matching entity |
 | `matched_entity` | string | that entity's `entity_context` (LLM-written description) |
 | `matched_brand` / `matched_category` | string | the entity's `BRAND` / `CATEGORY` concepts |
-| `match_type` | string | strongest evidence: `sku · brand · name · category · none` |
-| `match_score` | float64 | 0–1 blended score (SKU 1.0 > brand 0.75+ > name overlap > category 0.3) |
-| `coincides` | bool | `match_score ≥ coincide_threshold` (default 0.5) |
+| `match_type` | string | strongest evidence: `sku · brand+name · brand · name · category · none` |
+| `match_score` | float64 | 0–1 calibrated score (exact ≥ 0.85, strong ≥ 0.6, likely ≤ 0.45) |
+| `match_strength` | string | precision tier: `exact` (SKU, or brand + near-identical name) · `strong` (brand + corroboration, or near-identical name) · `likely` (brand alone / name alone — **never coincides**) · `none`. Brand or attribute conflicts (Cetaphil vs CeraVe; SPF 30 vs 60; lotion vs cream) cap the tier at `likely` |
+| `match_signals` | list\<string\> | which evidence fired: `sku_exact · brand_lexicon · brand_fuzzy · brand_in_entity · brand_conflict · name_containment · name_ngram · attr_agree · attr_conflict · category` |
+| `coincides` | bool | `match_strength ∈ {exact, strong}` **and** `match_score ≥ coincide_threshold` (default 0.5) |
 
 ---
 

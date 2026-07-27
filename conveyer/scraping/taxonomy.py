@@ -110,6 +110,13 @@ SUBTYPE_TO_CATEGORY: Dict[str, str] = {
     "wiki": "reference",
     "health": "reference",
     "howto": "reference",
+    # Service-aware platform routing (multi-service domains like google.com):
+    # a maps/places surface is informational; productivity / auth / utility
+    # services are confidently off-journey — docs.google.com is not a search
+    # page and never part of a shopping funnel, whatever the topic.
+    "local": "reference",     # maps / places / store-locator surfaces
+    "tool": "unrelated",      # docs, drive, mail, translate, cloud consoles …
+    "account": "unrelated",   # sign-in / account management surfaces
     "other": "unknown",
 }
 # Subtypes that push a shopping page from Intent to Purchase / Post-Purchase.

@@ -100,7 +100,8 @@ def test_matching_positive_and_negative():
                          categories={"moisturizer"})
     match_products([cerave, laptop, brandless], page_brand="", mentions=[mention],
                    message_id="m1", coincide_threshold=0.5)
-    _check(cerave.coincides and cerave.match_type == "brand", "brand match")
+    _check(cerave.coincides and cerave.match_type == "brand+name", "brand+name match")
+    _check(cerave.match_strength == "exact", f"strength {cerave.match_strength}")
     _check(not laptop.coincides, "laptop must not coincide")
     _check(not brandless.coincides, "brandless product must not inherit chat brand")
 
@@ -726,6 +727,377 @@ def test_reclassify_rescues_stale_unrelated():
         back = pd.read_parquet(path)
         _check(back.set_index("page_id").loc["p1", "page_category"] == "shopping",
                "parquet round-trip keeps the rescue")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Service-aware platform routing (the "all google links became search" bug)
+# --------------------------------------------------------------------------- #
+def test_service_routing_multi_service_platforms():
+    """One registrable domain, many products: the service (subdomain / first
+    path segment) must decide, and an unrecognized Google surface must NOT
+    default to 'search'."""
+    from conveyer.scraping import classify_url
+    cfg = ScrapeConfig(use_learned_model=False)   # isolate the routing rules
+    expect = {
+        "https://docs.google.com/document/d/abc/edit": ("unrelated", "tool"),
+        "https://drive.google.com/file/d/x/view": ("unrelated", "tool"),
+        "https://accounts.google.com/signin": ("unrelated", "account"),
+        "https://aws.amazon.com/s3/": ("unrelated", "tool"),
+        "https://mail.yahoo.com/d/folders/1": ("unrelated", "tool"),
+        "https://maps.google.com/maps/place/Sephora": ("reference", "local"),
+        "https://www.google.com/maps/place/Ulta": ("reference", "local"),
+        "https://news.google.com/stories/xyz": ("editorial", "article"),
+        "https://support.google.com/mail/answer/1": ("reference", "wiki"),
+        # marketplace SURFACES are topic-neutral; deep item pages demote to
+        # 'listing' so fetched off-topic content can still collapse them
+        "https://shopping.google.com/": ("catalogue", "marketplace"),
+        "https://shopping.google.com/product/123": ("catalogue", "listing"),
+        "https://www.facebook.com/marketplace": ("catalogue", "marketplace"),
+        "https://www.facebook.com/marketplace/item/9": ("catalogue", "listing"),
+        "https://www.google.com/search?q=best+retinol": ("search", "serp"),
+        "https://www.google.com/": ("search", "serp"),
+        "https://search.yahoo.com/search?p=serum": ("search", "serp"),
+    }
+    for url, (cat, sub) in expect.items():
+        r = classify_url(url, cfg)
+        _check((r.page_category, r.page_subtype) == (cat, sub),
+               f"{url} -> {r.page_category}/{r.page_subtype}, expected {cat}/{sub}")
+        _check("service" in r.signals, f"service channel must fire for {url}")
+    # unrecognized google surface: no false 'search', no invented category
+    r = classify_url("https://www.google.com/randomservice/thing", cfg)
+    _check(r.page_category != "search", f"unknown google surface -> {r.page_category}")
+    # the retailer behaviour of www.amazon.com is untouched (open fallback)
+    r = classify_url("https://www.amazon.com/dp/B00X", cfg)
+    _check(r.page_category == "shopping" and r.page_subtype == "pdp",
+           f"amazon pdp intact: {r.page_category}/{r.page_subtype}")
+
+
+def test_learned_model_channel():
+    """The self-trained model must autotrain, persist, vote as its own channel,
+    and stay strictly optional."""
+    import conveyer.scraping.model as M
+    out = tempfile.mkdtemp(prefix="conveyer_model_")
+    try:
+        path = os.path.join(out, "page_model.npz")
+        cfg = ScrapeConfig(model_path=path, model_autotrain=True)
+        url = "https://www.sephora.com/product/cerave-moisturizing-cream"
+        r = classify_rule(extract_page("", url), url, cfg)
+        _check(os.path.exists(path), "autotrain must persist the model file")
+        _check("model" in r.signals, f"model channel must fire: {r.signals}")
+        # numpy-only inference round-trip
+        m = M.PageModel.load(path)
+        probs = m.predict_proba_one(M.featurize(url))
+        _check(abs(sum(probs.values()) - 1.0) < 1e-4, "probabilities sum to 1")
+        _check(max(probs, key=probs.get) == "pdp", f"top class {max(probs, key=probs.get)}")
+        # the model knows the distilled service table standalone
+        probs = m.predict_proba_one(M.featurize("https://docs.google.com/document/d/x"))
+        _check(max(probs, key=probs.get) == "tool", f"docs.google -> {max(probs, key=probs.get)}")
+        # disabled -> channel silent
+        off = ScrapeConfig(model_path=path, use_learned_model=False)
+        r2 = classify_rule(extract_page("", url), url, off)
+        _check("model" not in r2.signals, "disabled model must not vote")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Block-resilient fetching: salvage headers/body, fingerprint the platform
+# --------------------------------------------------------------------------- #
+def _start_block_server():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    hits = {"n": 0, "agents": [], "paths": []}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits["paths"].append(self.path)
+            hits["agents"].append(self.headers.get("User-Agent", ""))
+            if self.path == "/robots.txt":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"User-agent: *\nAllow: /\n")
+                return
+            hits["n"] += 1
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("X-Shopify-Stage", "production")
+            self.send_header("Server", "cloudflare")
+            self.end_headers()
+            self.wfile.write(b"<html><body>Access denied</body></html>")
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}", hits
+
+
+def test_blocked_fetch_salvages_headers_and_fingerprint():
+    """A 403 is a wall, not a failure: one attempt (no hammering), headers +
+    bounded body salvaged, platform fingerprinted from them."""
+    from conveyer.scraping.fingerprint import detect_platform, platform_seller
+    srv, base, hits = _start_block_server()
+    try:
+        cfg = ScrapeConfig(offline=False, timeout=3.0, hard_timeout=6.0, max_retries=2,
+                           rate_limit_per_domain=0.0, use_cache=False)
+        f = Fetcher(cfg)
+        res = f.fetch(base + "/products/thing")
+        _check(res.status == "blocked", f"403 -> blocked, got {res.status}")
+        _check(res.http_status == 403, f"http_status {res.http_status}")
+        _check(hits["n"] == 1, f"403 must not be retried, got {hits['n']} hits")
+        _check(res.headers.get("x-shopify-stage") == "production",
+               f"headers salvaged: {res.headers}")
+        _check("denied" in res.error_body.lower(), "error body salvaged (bounded)")
+        _check(not res.html, "error body must never masquerade as page content")
+        plat = detect_platform(res.headers, res.error_body)
+        _check(plat == "shopify", f"commerce platform wins over the WAF: {plat}")
+        _check(platform_seller(plat) == "brand_owned", "shopify ⇒ DTC seller hint")
+        # robots.txt was still consulted before the page (politeness unchanged)
+        _check(hits["paths"][0] == "/robots.txt", f"robots first: {hits['paths']}")
+        # classifier: bot-walled Shopify store + /products/ URL = shopping page
+        cls = classify_rule(extract_page("", base + "/products/thing"),
+                            base + "/products/thing",
+                            ScrapeConfig(use_learned_model=False),
+                            content_scope="none", platform=plat)
+        _check(cls.page_category == "shopping" and cls.page_subtype == "pdp",
+               f"blocked shopify pdp -> {cls.page_category}/{cls.page_subtype}")
+        _check(cls.seller_type == "brand_owned", f"seller {cls.seller_type}")
+        _check("platform" in cls.signals, f"signals {cls.signals}")
+    finally:
+        srv.shutdown()
+
+
+def test_browser_headers_and_robots_compliance():
+    """browser_headers=True presents a realistic Chrome profile (naive UA
+    blocks don't fire); False keeps the descriptive bot UA. robots.txt is
+    honored in both modes."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    seen = {"agents": [], "paths": []}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["paths"].append(self.path)
+            seen["agents"].append(self.headers.get("User-Agent", ""))
+            body = b"<html><head><title>ok</title></head><body>fine</body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        f = Fetcher(ScrapeConfig(offline=False, rate_limit_per_domain=0.0, use_cache=False))
+        res = f.fetch(base + "/page")
+        _check(res.status == "ok", f"fetch ok: {res.status} {res.error}")
+        page_agents = [a for p, a in zip(seen["paths"], seen["agents"]) if p == "/page"]
+        _check("Chrome" in page_agents[0], f"browser profile sent: {page_agents[0][:60]}")
+        _check("/robots.txt" in seen["paths"], "robots.txt still consulted")
+        _check(res.headers.get("content-type", "").startswith("text/html"),
+               "response headers captured on OK fetches too")
+        seen["agents"].clear(); seen["paths"].clear()
+        f2 = Fetcher(ScrapeConfig(offline=False, browser_headers=False,
+                                  rate_limit_per_domain=0.0, use_cache=False))
+        f2.fetch(base + "/page2")
+        page_agents = [a for p, a in zip(seen["paths"], seen["agents"]) if p == "/page2"]
+        _check("conveyer-research-bot" in page_agents[0],
+               f"bot UA when browser_headers=False: {page_agents[0][:60]}")
+    finally:
+        srv.shutdown()
+
+
+def test_fingerprint_detection():
+    from conveyer.scraping.fingerprint import (detect_platform,
+                                               is_commerce_platform)
+    _check(detect_platform({"x-shopify-stage": "production"}) == "shopify", "shopify header")
+    _check(detect_platform({"cf-ray": "abc"}, "") == "cloudflare", "waf-only -> infra")
+    _check(not is_commerce_platform("cloudflare"), "infra is not commerce evidence")
+    woo = '<html><head><meta name="generator" content="WooCommerce 8.1"></head></html>'
+    _check(detect_platform({}, woo) == "woocommerce", "woocommerce markup")
+    _check(detect_platform({}, "<html>plain</html>") == "", "no false positives")
+
+
+# --------------------------------------------------------------------------- #
+# Precision-first product ↔ chat matching
+# --------------------------------------------------------------------------- #
+def test_matching_precision_tiers():
+    """Brand alone is not the product; conflicts veto; typos and long-tail
+    brands still connect."""
+    mention = RecMention(recommendation_id="r1", message_id="m1",
+                         entity_context="CeraVe Moisturizing Cream — a moisturizer "
+                                        "the assistant recommended",
+                         brands={"cerave"}, categories={"moisturizer"})
+    same_brand_other = ProductRecord(name="CeraVe Ultra Repair Lip Balm",
+                                     brand="CeraVe", price=9.99)
+    typo = ProductRecord(name="CereVe Moisturising Cream", brand="", price=16.0)
+    rival = ProductRecord(name="Cetaphil Moisturizing Cream", brand="Cetaphil", price=13.0)
+    match_products([same_brand_other, typo, rival], page_brand="",
+                   mentions=[mention], message_id="m1")
+    _check(not same_brand_other.coincides and same_brand_other.match_strength == "likely",
+           f"same brand ≠ same product: {same_brand_other.match_strength}")
+    _check(typo.coincides and "name_ngram" in typo.match_signals,
+           f"typo variant connects via char-ngrams: {typo.match_strength} {typo.match_signals}")
+    _check(not rival.coincides, "brand conflict vetoes however similar the name")
+    # SPF numbers are identity: SPF 30 is not the SPF 60 that was recommended
+    spf_mention = RecMention(recommendation_id="r2", message_id="m2",
+                             entity_context="La Roche-Posay Anthelios SPF 60 Sunscreen",
+                             brands={"la roche-posay"}, categories={"sunscreen"})
+    spf30 = ProductRecord(name="La Roche-Posay Anthelios SPF 30 Sunscreen",
+                          brand="La Roche-Posay", price=33.0)
+    spf60 = ProductRecord(name="La Roche-Posay Anthelios Sunscreen SPF 60 5 oz",
+                          brand="La Roche-Posay", price=35.99)
+    match_products([spf30, spf60], page_brand="", mentions=[spf_mention], message_id="m2")
+    _check(not spf30.coincides and "attr_conflict" in spf30.match_signals,
+           f"SPF conflict caps the verdict: {spf30.match_strength} {spf30.match_signals}")
+    _check(spf60.coincides, f"SPF agreement + brand + name: {spf60.match_strength}")
+    # long-tail brand nobody's lexicon knows, named in the entity text (jbca case)
+    jbca_mention = RecMention(recommendation_id="r3", message_id="m3",
+                              entity_context="the JBCA thickening strengthening "
+                                             "conditioner for weak hair",
+                              brands=set(), categories={"conditioner"})
+    jbca = ProductRecord(name="Thickening Strengthening & Restorative Conditioner",
+                         brand="JBCA Cosmetics", price=6.99)
+    match_products([jbca], page_brand="", mentions=[jbca_mention], message_id="m3")
+    _check(jbca.coincides and "brand_in_entity" in jbca.match_signals,
+           f"unknown brand connects via entity text: "
+           f"{jbca.match_strength} {jbca.match_signals}")
+
+
+def test_page_chat_match_rollup():
+    """Pages carry the connection to the chat at the page grain."""
+    out = tempfile.mkdtemp(prefix="conveyer_rollup_")
+    try:
+        art = run_scrape(ScrapeConfig(synthetic_n_pages=26, out_dir=out, progress_every=0))
+        pages = art["pages"]
+        _check("chat_match_strength" in pages.columns, "rollup column present")
+        pdp = pages[(pages["page_subtype"] == "pdp") & (pages["page_category"] == "shopping")
+                    & pages["url"].str.contains("moisturizing-cream")]
+        _check((pdp["chat_match_strength"] == "exact").any(),
+               f"recommended PDP rolls up exact: {pdp['chat_match_strength'].unique()}")
+        lip = pages[pages["url"].str.contains("lip-balm")]
+        _check(len(lip) > 0 and (lip["chat_match_strength"] != "exact").all()
+               and (~lip["chat_match_strength"].isin(["strong"])).all(),
+               f"hard negative stays below coincide: {lip['chat_match_strength'].unique()}")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Adversarial-review regressions (each of these reproduced a real defect)
+# --------------------------------------------------------------------------- #
+def test_platform_fingerprint_limits():
+    """The platform fingerprint is structural evidence only: it must not make
+    off-topic stores study-relevant, and it must not outvote a curated
+    retailer's role."""
+    cfg = ScrapeConfig(use_learned_model=False)
+    # fetched OFF-TOPIC Shopify store homepage: still collapses to unrelated
+    html = ('<html lang="en"><head><title>Apex Gaming Gear | Official Site</title>'
+            '<meta property="og:type" content="website">'
+            '<script type="application/ld+json">{"@type":"Organization","name":"Apex"}</script>'
+            '</head><body><h1>Apex Gaming Gear</h1>'
+            '<p>Mechanical keyboards and mice. Free shipping.</p></body></html>')
+    url = "https://apexgaminggear.example/"
+    r = classify_rule(extract_page(html, url), url, cfg, platform="shopify")
+    _check(r.page_category == "unrelated" and not r.is_study_relevant,
+           f"off-topic shopify homepage -> {r.page_category}/{r.is_study_relevant}")
+    # a curated retailer that happens to run Shopify keeps its retailer role
+    about = "https://www.credobeauty.com/pages/about-us"
+    html2 = ('<html lang="en"><head><title>About Us | Credo Beauty</title></head>'
+             '<body><h1>About Credo</h1><p>Clean beauty skincare retailer.</p></body></html>')
+    r2 = classify_rule(extract_page(html2, about), about, cfg, platform="shopify")
+    _check(r2.seller_type != "brand_owned",
+           f"curated retailer must not flip to brand_owned: {r2.seller_type}")
+    # fetched off-topic marketplace ITEM page collapses (deep ≠ neutral surface)
+    fb = "https://www.facebook.com/marketplace/item/123456"
+    html3 = ('<html lang="en"><head><title>Used mountain bike - $250</title></head>'
+             '<body><h1>Trek Marlin 5 mountain bike</h1><p>Good condition. $250.</p></body></html>')
+    r3 = classify_rule(extract_page(html3, fb), fb, cfg)
+    _check(r3.page_category == "unrelated",
+           f"off-topic marketplace item -> {r3.page_category}")
+    # locale subdomains of search engines are still the search engine
+    r4 = classify_rule(extract_page("", "https://cn.bing.com/"), "https://cn.bing.com/", cfg)
+    _check(r4.page_category == "search", f"cn.bing.com -> {r4.page_category}")
+    # invariant: final 'unrelated' (e.g. a docs.google.com doc ABOUT skincare)
+    # is never study-relevant
+    doc = "https://docs.google.com/document/d/abc/edit"
+    html5 = ('<html lang="en"><head><title>My skincare routine</title></head>'
+             '<body><p>retinol serum moisturizer sunscreen niacinamide</p></body></html>')
+    r5 = classify_rule(extract_page(html5, doc), doc, cfg)
+    _check(r5.page_category == "unrelated" and not r5.is_study_relevant,
+           f"tool page invariant: {r5.page_category}/{r5.is_study_relevant}")
+    # model_weight=0 must not mint earned roles out of thin air (0 >= 0 bug)
+    zero = ScrapeConfig(use_learned_model=False, model_weight=0.0)
+    myst = "https://someblog-nobody-knows.xyz/interesting"
+    r6 = classify_rule(extract_page("", myst), myst, zero)
+    _check(r6.page_category == "unknown", f"model_weight=0 -> {r6.page_category}")
+
+
+def test_matching_sibling_and_synonym_regressions():
+    """Same-brand siblings sharing only generic words must not coincide;
+    form synonyms (wash/cleanser) of the SAME product must."""
+    mention = RecMention(recommendation_id="r1", message_id="m1",
+                         entity_context="CeraVe Moisturizing Cream — a rich "
+                                        "moisturizer the assistant recommended",
+                         brands={"cerave"}, categories={"moisturizer"})
+    sibling = ProductRecord(name="CeraVe Foaming Facial Cleanser", brand="CeraVe",
+                            category="cleanser", price=15.0)
+    eye = ProductRecord(name="CeraVe Eye Repair Cream", brand="CeraVe",
+                        category="moisturizer", price=14.0)
+    generic = ProductRecord(name="Moisturizer", brand="", price=9.0)
+    match_products([sibling, eye, generic], page_brand="cerave",
+                   mentions=[mention], message_id="m1")
+    _check(not sibling.coincides, f"sibling cleanser: {sibling.match_strength}")
+    _check(not eye.coincides,
+           f"same brand+form, different product: {eye.match_strength}")
+    _check(not generic.coincides and generic.match_strength != "strong",
+           f"1-token generic name: {generic.match_strength}")
+    # wash vs cleanser are the same form — a real match must survive
+    wash_mention = RecMention(recommendation_id="r2", message_id="m2",
+                              entity_context="the CeraVe foaming face wash for oily skin",
+                              brands={"cerave"}, categories={"cleanser"})
+    cleanser = ProductRecord(name="CeraVe Foaming Facial Cleanser", brand="CeraVe",
+                             category="cleanser", price=15.0)
+    match_products([cleanser], page_brand="", mentions=[wash_mention], message_id="m2")
+    _check(cleanser.coincides,
+           f"wash≡cleanser synonym must match: {cleanser.match_strength} {cleanser.match_signals}")
+    # a common-adjective brand must not 'agree' via ordinary prose when the
+    # mention explicitly names a different brand
+    simple = ProductRecord(name="Kind To Skin Facial Wash", brand="Simple", price=6.0)
+    adj_mention = RecMention(recommendation_id="r3", message_id="m3",
+                             entity_context="a simple, fragrance-free cleanser "
+                                            "like CeraVe's foaming wash",
+                             brands={"cerave"}, categories={"cleanser"})
+    match_products([simple], page_brand="", mentions=[adj_mention], message_id="m3")
+    _check(not simple.coincides and "brand_in_entity" not in simple.match_signals,
+           f"adjective ≠ brand agreement: {simple.match_signals}")
+
+
+def test_retry_after_and_model_resilience():
+    from conveyer.scraping.fetch import _parse_retry_after
+    from conveyer.scraping.model import PageModel, _FAILED_PATHS, _model_for
+    _check(_parse_retry_after("120") == 120.0, "delta-seconds form")
+    _check(_parse_retry_after("") is None and _parse_retry_after("soon") is None,
+           "unparseable -> None (falls back to backoff retries)")
+    ra = _parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT")
+    _check(ra is not None and ra >= 0, f"HTTP-date form parses: {ra}")
+    # a corrupt model file must not silently kill the channel: retrain over it
+    out = tempfile.mkdtemp(prefix="conveyer_modelcorrupt_")
+    try:
+        path = os.path.join(out, "model.npz")
+        with open(path, "wb") as fh:
+            fh.write(b"not an npz at all")
+        cfg = ScrapeConfig(model_path=path, model_autotrain=True)
+        m = _model_for(cfg)
+        _check(m is not None, "corrupt file retrained")
+        _check(PageModel.load(path) is not None, "replacement file is valid")
+        _check(path not in _FAILED_PATHS, "path not marked failed after recovery")
     finally:
         shutil.rmtree(out, ignore_errors=True)
 

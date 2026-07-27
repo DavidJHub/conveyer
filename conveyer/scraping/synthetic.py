@@ -311,6 +311,22 @@ def make_corpus(n_pages: int = 60, seed: int = 42) -> ScrapeSources:
         add(u, h, c, s, st, mid, recommended=False, coincides_expected=False,
             page_type_prior="pdp" if turn % 2 == 0 else None)
 
+        # HARD NEGATIVES for the matcher (precision-first coincide):
+        # same brand, DIFFERENT product — brand agreement alone must not
+        # coincide (the same brand is not the same product)
+        u, h, c, s, st = _pdp(brand, domain, "Ultra Repair Lip Balm",
+                              "lip balm", 9.99, 4.3, 812)
+        add(u, h, c, s, st, mid, recommended=False, coincides_expected=False,
+            page_type_prior="pdp", seller_prior="1p",
+            site_category="E-commerce_and_Shopping")
+        # different brand, SAME product line — a brand conflict must veto the
+        # coincide however similar the names read
+        rival = _CATALOG[(turn + 1) % len(_CATALOG)]
+        u, h, c, s, st = _pdp(rival[0], rival[1], product, cat, price, 4.1, 500)
+        add(u, h, c, s, st, mid, recommended=False, coincides_expected=False,
+            page_type_prior="pdp", seller_prior="1p",
+            site_category="E-commerce_and_Shopping")
+
         # a cart page that can never be fetched (html=None → offline_miss):
         # the multimodal classifier must label it from URL + domain alone
         cart_url = (f"https://www.{retailer[1]}/gp/cart/view.html?ref_=nav_cart"

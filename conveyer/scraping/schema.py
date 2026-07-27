@@ -45,6 +45,9 @@ PAGE_SCHEMA = pa.schema([
     ("fetch_status", _S), ("http_status", _I32), ("content_type", _S),
     ("fetched_at", _S), ("fetch_error", _S), ("from_cache", _B),
     ("fetch_scope", _S), ("parser", _S), ("html_path", _S),
+    # salvage: whatever the response gave us even when blocked — the header
+    # map (JSON) and the platform it fingerprints (shopify/woocommerce/…)
+    ("response_headers", _S), ("server_platform", _S),
     # extracted page info
     ("lang", _S), ("title", _S), ("meta_description", _S), ("h1", _S),
     ("canonical_url", _S), ("og_type", _S), ("og_site_name", _S),
@@ -57,6 +60,9 @@ PAGE_SCHEMA = pa.schema([
     ("classification_signals", _LS),
     ("skincare_relevance", _F64), ("is_study_relevant", _B),
     ("primary_brand", _S), ("brand_detected", _LS),
+    # page ↔ chat product connection, rolled up from this page's product rows:
+    # the best match tier against the mentions of the turns that surfaced it
+    ("chat_match_strength", _S), ("chat_match_score", _F64),
     # provenance + vendor prior
     ("source_tables", _LS), ("times_surfaced", _I32), ("times_recommended", _I32),
     ("times_visited", _I32), ("resulted_in_purchase_any", _B),
@@ -79,7 +85,8 @@ PRODUCT_SCHEMA = pa.schema([
     # match to chat recommendation
     ("matched_message_id", _S), ("matched_recommendation_id", _S),
     ("matched_entity", _S), ("matched_brand", _S), ("matched_category", _S),
-    ("match_type", _S), ("match_score", _F64), ("coincides", _B),
+    ("match_type", _S), ("match_score", _F64),
+    ("match_strength", _S), ("match_signals", _LS), ("coincides", _B),
 ])
 
 
@@ -104,9 +111,12 @@ def _as_int(x) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 def page_row(url_row: dict, fetch: FetchResult, content: PageContent,
              cls: PageClass, n_products: int, fetch_scope: str = "page",
-             html_path: str = "") -> dict:
+             html_path: str = "", platform: str = "",
+             chat_match: Tuple[str, float] = ("none", 0.0)) -> dict:
+    import json as _json
     url = url_row.get("url") or fetch.url
     u = parse_url(url)
+    headers = getattr(fetch, "headers", None) or {}
     return {
         "page_id": page_id_for(url),
         "url": url,
@@ -125,6 +135,8 @@ def page_row(url_row: dict, fetch: FetchResult, content: PageContent,
         "fetch_scope": fetch_scope,
         "parser": content.parser,
         "html_path": html_path,
+        "response_headers": _json.dumps(headers, ensure_ascii=False) if headers else "",
+        "server_platform": platform,
         "lang": content.lang,
         "title": content.title,
         "meta_description": content.meta_description,
@@ -152,6 +164,8 @@ def page_row(url_row: dict, fetch: FetchResult, content: PageContent,
         "is_study_relevant": bool(cls.is_study_relevant),
         "primary_brand": cls.primary_brand,
         "brand_detected": list(cls.brand_detected),
+        "chat_match_strength": chat_match[0] or "none",
+        "chat_match_score": float(chat_match[1] or 0.0),
         "source_tables": list(url_row.get("sources", []) or []),
         "times_surfaced": _as_int(url_row.get("times_surfaced")) or 0,
         "times_recommended": _as_int(url_row.get("times_recommended")) or 0,
@@ -187,7 +201,10 @@ def product_rows(page_id: str, url: str, products: List[ProductRecord]) -> List[
             "matched_recommendation_id": r.matched_recommendation_id,
             "matched_entity": r.matched_entity, "matched_brand": r.matched_brand,
             "matched_category": r.matched_category, "match_type": r.match_type,
-            "match_score": float(r.match_score), "coincides": bool(r.coincides),
+            "match_score": float(r.match_score),
+            "match_strength": r.match_strength or "none",
+            "match_signals": list(r.match_signals),
+            "coincides": bool(r.coincides),
         })
     return rows
 

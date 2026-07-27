@@ -6,22 +6,35 @@ when available, the SimilarWeb ``dim_digital_site`` prior), decide the headline
 *shopping* (retailer or brand-owned), *unrelated* — and the four proposed extra
 categories (*editorial, search, community, reference*).
 
-The classifier is **multimodal**: five independent evidence channels vote and
-any one of them can carry a page on its own —
+The classifier is **multimodal**: independent evidence channels vote and any
+one of them can carry a page on its own —
 
 1. **URL structure** — path/query tokens (``/cart/``, ``checkout``,
    ``/dp/…``, ``/search?q=``, ``ref_=nav_cart``, …);
-2. **domain knowledge** — the registrable domain against curated retailer /
+2. **service routing** — multi-service platforms (google, bing, yahoo,
+   facebook, …) are routed by subdomain + first path segment BEFORE the
+   generic domain vote: ``docs.google.com`` is a document tool, not "search";
+   ``shopping.google.com`` is a marketplace; an *unrecognized* Google surface
+   gets no domain opinion at all (see ``_PLATFORM_SERVICES``);
+3. **domain knowledge** — the registrable domain against curated retailer /
    marketplace / search / community / editorial / reference / brand lists
    (``amazon.com`` *is* a retailer, fetched or not);
-3. **page content & markup** — schema.org ``@type``, OpenGraph, price /
+4. **page content & markup** — schema.org ``@type``, OpenGraph, price /
    add-to-cart / product-count signals (only when the page was fetched);
-4. **vendor prior** — ``dim_digital_site.page_type`` when available;
-5. **domain directory** — a :class:`~conveyer.scraping.directory.DomainEntry`
+5. **vendor prior** — ``dim_digital_site.page_type`` when available;
+6. **domain directory** — a :class:`~conveyer.scraping.directory.DomainEntry`
    (role + description) for domains the curated lists don't know, sourced
    from the built-in seed or the external file at
    ``ScrapeConfig.directory_path``. Its description can also stand in as
-   content when the page is unfetchable (``content_scope="directory"``).
+   content when the page is unfetchable (``content_scope="directory"``);
+7. **hosting-platform fingerprint** — response headers / markup identify the
+   commerce platform (Shopify, WooCommerce, …): storefront corroboration that
+   survives a bot wall (see :mod:`conveyer.scraping.fingerprint`);
+8. **learned model** — a self-trained multinomial logistic classifier over
+   hashed URL/markup/text features (:mod:`conveyer.scraping.model`), voting
+   subtype probabilities scaled by ``ScrapeConfig.model_weight``. Train it on
+   the synthetic ground truth and/or your own labelled parquet:
+   ``python -m conveyer.scraping.model train``.
 
 Votes are summed, the argmax wins with a softmax confidence, and
 ``PageClass.signals`` records which modalities actually fired so every label is
@@ -290,6 +303,153 @@ def _known_domain(u: UrlParts, directory_entry: "Optional[DomainEntry]" = None) 
 # locale root (/us, /en-us) never reads differently from "/".
 _ROOT_PATHS = ("", "/", "/index.html", "/home", "/us", "/en", "/en-us")
 
+# --------------------------------------------------------------------------- #
+# Service-aware routing for multi-service platforms
+# --------------------------------------------------------------------------- #
+# One registrable domain, many products: "google ∈ SEARCH_DOMAINS ⇒ serp" is
+# wrong for most Google URLs — docs.google.com is a document, maps.google.com
+# is a places surface, news.google.com is editorial, accounts.google.com is an
+# auth wall. The service (subdomain, or first path segment on the www host)
+# decides; when a platform is listed here its service verdict REPLACES the
+# generic domain vote, and an *unrecognized* service of a strict platform gets
+# NO domain opinion at all (URL/markup channels must carry it) instead of a
+# false "search" label. Weights ≥ 2.0 are decisive (they earn the subtype).
+#
+# Two fallback semantics, chosen per platform:
+#   "fallback": {}   — strict: unmatched service ⇒ no domain opinion (google);
+#   no "fallback" key — open: unmatched ⇒ the generic curated-list vote
+#                       (amazon www pages keep behaving like a retailer).
+_TOOL = {"tool": 2.5}
+_ACCT = {"account": 2.5}
+_WIKI = {"wiki": 2.5}
+_NEWS = {"article": 2.5}
+_PLATFORM_SERVICES: Dict[str, dict] = {
+    "google": {
+        "subdomains": {
+            "shopping": {"marketplace": 2.6}, "store": {"collection": 2.0},
+            "news": _NEWS, "support": _WIKI, "scholar": _WIKI, "books": _WIKI,
+            "developers": _WIKI, "maps": {"local": 2.5}, "lens": {"serp": 2.5},
+            "images": {"serp": 2.5}, "docs": _TOOL, "drive": _TOOL,
+            "mail": _TOOL, "calendar": _TOOL, "meet": _TOOL, "photos": _TOOL,
+            "translate": _TOOL, "pay": _TOOL, "gemini": _TOOL, "ads": _TOOL,
+            "analytics": _TOOL, "cloud": _TOOL, "firebase": _TOOL,
+            "colab": _TOOL, "sites": _TOOL, "groups": {"forum": 2.5},
+            "accounts": _ACCT, "myaccount": _ACCT,
+            "play": {"marketplace": 2.0},
+        },
+        "paths": {
+            "search": {"serp": 3.0}, "webhp": {"serp": 3.0}, "imghp": {"serp": 3.0},
+            "shopping": {"marketplace": 2.6}, "maps": {"local": 2.5},
+            "travel": _TOOL, "flights": _TOOL, "finance": {"article": 2.0},
+            "books": _WIKI, "forms": _TOOL, "sheets": _TOOL, "slides": _TOOL,
+            "drive": _TOOL, "intl": _TOOL, "business": _TOOL, "chrome": _TOOL,
+            "url": {"tool": 1.0},   # redirect wrapper; the target URL is the real page
+        },
+        "root": {"serp": 3.0},
+        "fallback": {},
+    },
+    "bing": {
+        "paths": {"search": {"serp": 3.0}, "images": {"serp": 2.5},
+                  "videos": {"serp": 2.5}, "news": {"serp": 2.5},
+                  "shop": {"marketplace": 2.4}, "maps": {"local": 2.5},
+                  "ck": {"tool": 1.0}},   # /ck/a click-tracking redirect
+        "root": {"serp": 3.0},
+        "fallback": {"serp": 1.5},
+    },
+    "yahoo": {
+        "subdomains": {"search": {"serp": 3.0}, "mail": _TOOL,
+                       "finance": {"article": 2.0}, "news": _NEWS,
+                       "sports": _NEWS, "shopping": {"marketplace": 2.4},
+                       "login": _ACCT},
+        "paths": {"news": _NEWS, "lifestyle": {"article": 2.0},
+                  "entertainment": {"article": 2.0}},
+        "root": {"serp": 3.0},
+        "fallback": {},
+    },
+    "amazon": {   # open fallback: www pages keep the retailer behaviour
+        "subdomains": {"aws": _TOOL, "music": _TOOL, "advertising": _TOOL,
+                       "affiliate-program": _TOOL, "developer": _WIKI,
+                       "sellercentral": _TOOL, "kdp": _TOOL, "read": _TOOL},
+    },
+    "facebook": {
+        "subdomains": {"business": _TOOL, "developers": _WIKI, "ads": _TOOL},
+        "paths": {"marketplace": {"marketplace": 2.6}, "business": _TOOL,
+                  "help": _WIKI, "policies": _WIKI, "login": _ACCT},
+    },
+    "instagram": {
+        "paths": {"shop": {"marketplace": 2.2}, "accounts": _ACCT},
+    },
+    "youtube": {
+        "subdomains": {"music": _TOOL, "studio": _TOOL, "support": _WIKI},
+        "paths": {"shopping": {"marketplace": 2.2}},
+    },
+    "x": {"subdomains": {"ads": _TOOL, "business": _TOOL, "help": _WIKI,
+                         "developer": _WIKI}},
+    "twitter": {"subdomains": {"ads": _TOOL, "business": _TOOL, "help": _WIKI,
+                               "developer": _WIKI}},
+    "apple": {
+        "subdomains": {"support": _WIKI, "developer": _WIKI, "music": _TOOL,
+                       "tv": _TOOL, "podcasts": _TOOL, "books": _TOOL,
+                       "apps": {"marketplace": 2.0}, "appstoreconnect": _TOOL,
+                       "id": _ACCT, "icloud": _TOOL},
+        "paths": {"shop": {"collection": 2.0}, "store": {"collection": 2.0}},
+    },
+    "microsoft": {
+        "subdomains": {"support": _WIKI, "learn": _WIKI, "docs": _WIKI,
+                       "azure": _TOOL, "login": _ACCT, "account": _ACCT},
+        "paths": {"store": {"marketplace": 2.0}},
+    },
+}
+
+# subdomain labels that are presentation variants, not services
+_TRANSPARENT_SUBDOMAINS = {"www", "www2", "m", "mobile", "amp", "en", "us", "l"}
+
+
+def _deep_marketplace_demoted(votes: Dict[str, float], u: UrlParts) -> Dict[str, float]:
+    """Topic-neutrality belongs to the marketplace SURFACE, not its items:
+    ``facebook.com/marketplace`` is journey infrastructure, but
+    ``facebook.com/marketplace/item/<id>`` is one specific listing — fetched
+    off-topic content must still be able to collapse it. Deep paths keep the
+    same decisive weight under the non-neutral ``listing`` subtype."""
+    if "marketplace" not in votes:
+        return votes
+    segs = [s for s in u.path.strip("/").split("/") if s]
+    if len(segs) >= 2:
+        votes = dict(votes)
+        votes["listing"] = max(votes.pop("marketplace"), votes.get("listing", 0.0))
+    return votes
+
+
+def _service_votes(u: UrlParts) -> Optional[Dict[str, float]]:
+    """Service verdict for a multi-service platform URL.
+
+    Returns ``None`` when the domain is not a listed platform or the platform
+    is open and nothing matched (caller proceeds with the generic domain
+    votes); ``{}`` when the platform matched but the service is unrecognized
+    on a strict platform (caller suppresses the generic domain vote — an
+    unknown Google surface must NOT read as "search"); otherwise the matched
+    service's subtype votes."""
+    plat = _PLATFORM_SERVICES.get(u.core)
+    if plat is None:
+        return None
+    sub = u.subdomain.split(".")[-1] if u.subdomain else ""
+    # locale labels (cn.bing.com, es.yahoo.com, en.m.wikipedia-style prefixes)
+    # are presentation, not services — treat like www
+    if sub in _TRANSPARENT_SUBDOMAINS or (len(sub) == 2 and sub.isalpha()):
+        sub = ""
+    if sub:
+        rules = plat.get("subdomains", {})
+        if sub in rules:
+            return _deep_marketplace_demoted(dict(rules[sub]), u)
+        return plat.get("fallback")   # unknown subdomain of the platform
+    seg = u.path.strip("/").split("/", 1)[0] if u.path.strip("/") else ""
+    prules = plat.get("paths", {})
+    if seg and seg in prules:
+        return _deep_marketplace_demoted(dict(prules[seg]), u)
+    if u.path in _ROOT_PATHS and "root" in plat:
+        return dict(plat["root"])
+    return plat.get("fallback")
+
 
 def _url_subtype_votes(u: UrlParts) -> Dict[str, float]:
     """Vote for structural subtypes from the URL path/query."""
@@ -394,6 +554,40 @@ def _directory_votes(entry: "Optional[DomainEntry]", u: UrlParts) -> Dict[str, f
     return v
 
 
+def _platform_votes(platform: str, u: "Optional[UrlParts]" = None) -> Dict[str, float]:
+    """Corroborating votes from the hosting-platform fingerprint. A commerce
+    platform (Shopify, WooCommerce, …) says "this domain is a storefront" —
+    domain-level evidence, deliberately below the 2.0 'earned' bar: it
+    corroborates a /products/… URL on a bot-walled store, it does not carry a
+    page alone. On a CURATED retailer/marketplace domain the fingerprint adds
+    nothing the lists don't already know — and its brand_site vote must never
+    outvote the retailer role (credobeauty.com runs Shopify but is a curated
+    retailer, not a DTC brand site)."""
+    if not platform:
+        return {}
+    if u is not None and (u.core in RETAILER_DOMAINS or u.core in MARKETPLACE_DOMAINS):
+        return {}
+    from .fingerprint import is_commerce_platform
+    if is_commerce_platform(platform):
+        return {"brand_site": 1.2, "pdp": 0.4, "collection": 0.3}
+    return {}
+
+
+def _model_votes(page: Optional[PageContent], url: str, cfg: ScrapeConfig,
+                 platform: str = "") -> Dict[str, float]:
+    """The learned channel: subtype probabilities from the trained model (see
+    :mod:`conveyer.scraping.model`), scaled by ``cfg.model_weight``. Returns
+    ``{}`` whenever the model is disabled, missing, or fails — the rule
+    channels never depend on it."""
+    if not getattr(cfg, "use_learned_model", False):
+        return {}
+    try:
+        from .model import predict_votes
+        return predict_votes(page, url, cfg, platform=platform)
+    except Exception:
+        return {}
+
+
 def _markup_votes(page: PageContent, n_products: int) -> Dict[str, float]:
     v: Dict[str, float] = {}
     types = set(page.schema_types())
@@ -477,7 +671,8 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
                   chat_brands: Optional[set] = None,
                   domain_profile: Optional[dict] = None,
                   directory_entry: "Optional[DomainEntry]" = None,
-                  content_scope: str = "page") -> PageClass:
+                  content_scope: str = "page",
+                  platform: str = "") -> PageClass:
     """``domain_profile`` is knowledge *learned from other pages of the same
     domain* ({"relevance": 0..1, "seller": ...}): it floors topical relevance
     and fills a missing seller_type, so URLs skipped by the fetch policy (or
@@ -488,20 +683,34 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     domain lists are silent, and its site category stands in for the vendor
     prior. ``content_scope`` says whose words ``page`` carries — "page" (its
     own), "base" (the base URL's), "directory" (the entry's description) or
-    "none": only the page's OWN content may prove it unrelated."""
+    "none": only the page's OWN content may prove it unrelated.
+    ``platform`` is the hosting-platform fingerprint from the response headers
+    (see :mod:`conveyer.scraping.fingerprint`) — a Shopify/WooCommerce store
+    is storefront evidence even when the page itself was bot-walled."""
     chat_brands = chat_brands or set()
     u = parse_url(url or page.url)
     prior = prior or {}
     entry_role = getattr(directory_entry, "role", "") if directory_entry is not None else ""
 
     # each modality votes independently; any one can carry the page alone.
-    # The directory only speaks when the curated domain lists are silent.
-    domain_votes = _domain_votes(u, page, chat_brands)
+    # Service-aware routing replaces the generic domain vote on multi-service
+    # platforms (docs.google.com must not read as "search"); the directory
+    # only speaks when both the platform table and curated lists are silent.
+    svc = _service_votes(u)
+    service_votes = dict(svc) if svc else {}
+    domain_votes = _domain_votes(u, page, chat_brands) if svc is None else {}
     modality_votes = {
         "url": _url_subtype_votes(u),
+        "service": service_votes,
         "domain": domain_votes,
         "markup": _markup_votes(page, n_products),
-        "directory": {} if domain_votes else _directory_votes(directory_entry, u),
+        "platform": _platform_votes(platform, u),
+        "directory": {} if (svc is not None or domain_votes)
+        else _directory_votes(directory_entry, u),
+        # the model sees only what training saw: the page's OWN content or the
+        # bare URL — never a base-page/directory stand-in (train/serve match)
+        "model": _model_votes(page if content_scope == "page" else None,
+                              url, cfg, platform),
     }
     votes: Dict[str, float] = {}
     for src in modality_votes.values():
@@ -559,6 +768,15 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
             relevance, profile_used = round(prof_rel, 3), True
     known = _known_domain(u) or (domain_profile is not None
                                  and float(domain_profile.get("relevance", 0) or 0) >= 0.15)
+    # a fingerprinted commerce platform vouches for the domain's STRUCTURAL
+    # role only — an unfetchable /products/… on a Shopify store keeps the
+    # shopping category, like an unfetched amazon.com/dp/…. It must NOT feed
+    # the (neutral and known) relevance shortcut: an off-topic Shopify store's
+    # homepage is not journey infrastructure just because Shopify hosts it.
+    structural_known = known
+    if not structural_known and platform:
+        from .fingerprint import is_commerce_platform
+        structural_known = is_commerce_platform(platform)
     # the winning subtype must be *earned* by structural evidence: a URL/markup
     # vote, a matching vendor prior, or a decisive domain/directory role
     # (>= 2.0 — search engine, community, editorial, reference, storefront
@@ -567,7 +785,11 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     prior_sub = SIMILARWEB_PAGE_TYPE_TO_SUBTYPE.get(prior_page_type) if prior_fired else None
     earned = (subtype in modality_votes["url"] or subtype in modality_votes["markup"]
               or subtype == prior_sub or modality_votes["domain"].get(subtype, 0.0) >= 2.0
-              or modality_votes["directory"].get(subtype, 0.0) >= 2.0)
+              or modality_votes["service"].get(subtype, 0.0) >= 2.0
+              or modality_votes["directory"].get(subtype, 0.0) >= 2.0
+              # model earns only with a real, confident vote (p >= 0.5); the
+              # chained 0 < guard keeps model_weight=0 from making 0 >= 0 true
+              or 0.0 < 0.5 * cfg.model_weight <= modality_votes["model"].get(subtype, 0.0))
     # a SERP whose URL exposes the query is NOT topic-neutral — the query text
     # itself decides relevance (q=best+retinol vs q=gaming+laptops)
     serp_with_query = subtype in ("serp", "site_search") and \
@@ -592,6 +814,11 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
         elif domain_profile and domain_profile.get("seller") in ("brand_owned", "retailer"):
             seller = domain_profile["seller"]
             profile_used = True
+        elif platform:
+            # a self-hosted commerce platform (Shopify/WooCommerce/…) on a
+            # domain no list knows is a DTC storefront in the overwhelming case
+            from .fingerprint import platform_seller
+            seller = platform_seller(platform) or seller
 
     # topical relevance overrides the headline bucket (user's "unrelated" case).
     # "unrelated" is a *confident* judgement — it needs the page's OWN content
@@ -608,10 +835,16 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
         if not is_relevant:
             if real_content:
                 final_category = "unrelated"
-            elif not (earned and (known or self_evident)):
+            elif not (earned and (structural_known or self_evident)):
                 final_category = "unknown"
         elif not real_content and not (earned or self_evident):
             final_category = "unknown"
+    # invariant: a page whose FINAL headline is 'unrelated' (off-topic collapse
+    # or an intrinsically off-journey subtype like tool/account) is never
+    # study-relevant — a shared Google Doc that happens to mention retinol is
+    # still not part of anyone's shopping journey
+    if final_category == "unrelated":
+        is_relevant = False
 
     # page-intrinsic brand (the brand this page is *about*) — used for matching.
     # Deliberately NOT the chat brand: letting a brand-less product inherit the
@@ -704,11 +937,13 @@ def classify_page(page: PageContent, url: str, cfg: ScrapeConfig,
                   chat_brands: Optional[set] = None,
                   domain_profile: Optional[dict] = None,
                   directory_entry: "Optional[DomainEntry]" = None,
-                  content_scope: str = "page") -> PageClass:
+                  content_scope: str = "page",
+                  platform: str = "") -> PageClass:
     """Full classification with the configured strategy and graceful fallback."""
     result = classify_rule(page, url, cfg, prior=prior, n_products=n_products,
                            chat_brands=chat_brands, domain_profile=domain_profile,
-                           directory_entry=directory_entry, content_scope=content_scope)
+                           directory_entry=directory_entry, content_scope=content_scope,
+                           platform=platform)
     want_llm = cfg.classifier == "llm" or (cfg.classifier == "auto"
                                            and result.confidence < 0.55 and _llm_available(cfg))
     if want_llm and _llm_available(cfg):

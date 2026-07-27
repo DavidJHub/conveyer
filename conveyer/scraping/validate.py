@@ -64,7 +64,13 @@ _REPORT_COLUMNS = ["page_id", "url", "page_category", "page_subtype",
 
 def _classify_url_only(url: str, cfg: ScrapeConfig) -> PageClass:
     # same as conveyer.scraping.classify_url, imported piecewise to keep this
-    # module usable from pipeline.py without a package-init import cycle
+    # module usable from pipeline.py without a package-init import cycle.
+    # The learned model is explicitly OFF here: this pass is documented as
+    # "the URL rules alone" — its verdicts must be deterministic and identical
+    # on every machine, not a function of whatever CWD-relative model file
+    # happens to exist (or get autotrained as a side effect).
+    import dataclasses
+    cfg = dataclasses.replace(cfg, use_learned_model=False)
     entry = lookup(url, cfg.directory_path) if cfg.directory_fallback else None
     return classify_rule(PageContent(url=url), url, cfg, directory_entry=entry)
 

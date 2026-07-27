@@ -55,9 +55,14 @@ class ScrapeConfig:
 
     # --- Fetching (safe by default) ----------------------------------------- #
     offline: bool = True                 # serve pages from the corpus, never the network
-    respect_robots: bool = True
+    respect_robots: bool = True          # ALWAYS honored — browser_headers below
+                                         # changes presentation, not compliance
     user_agent: str = ("conveyer-research-bot/0.2 (+https://github.com/; "
                        "skincare agentic-commerce study; contact via repo)")
+    browser_headers: bool = True         # present a realistic browser header
+                                         # profile instead of the bot UA: many
+                                         # CDNs 403 unknown UA strings outright.
+                                         # robots.txt is still checked either way
     timeout: float = 10.0                # socket connect/read timeout (per request)
     hard_timeout: float = 30.0           # wall-clock cap per URL: covers robots +
                                          # all retries + slow-dribble bodies. A URL
@@ -118,6 +123,20 @@ class ScrapeConfig:
                                          # code: plain case-insensitive phrases
                                          # ("beard oil",), matched whole-word in
                                          # page text AND URL slugs
+
+    # --- Learned classifier (the self-trained channel) ----------------------- #
+    use_learned_model: bool = True       # add the trained model's subtype
+                                         # probabilities as one more voting
+                                         # channel ("model" in signals)
+    model_path: str = "outputs/page_model.npz"
+    model_autotrain: bool = True         # if the model file is missing, train
+                                         # one on the synthetic ground truth
+                                         # (deterministic, a few seconds, once)
+    model_weight: float = 2.0            # vote weight = model_weight × probability;
+                                         # below the decisive 2.5–3.0 rule votes,
+                                         # so the model tips ties but cannot
+                                         # overrule a /cart/ path or a curated
+                                         # domain role on its own
 
     # --- Product <-> chat matching ------------------------------------------ #
     match_name_threshold: float = 0.34   # token-overlap cutoff for a name match

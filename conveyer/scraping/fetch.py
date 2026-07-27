@@ -39,7 +39,7 @@ from .config import ScrapeConfig
 class FetchResult:
     url: str
     status: str = "error"          # ok | cached | error | skipped | offline_miss |
-                                   # robots_blocked | circuit_open
+                                   # robots_blocked | circuit_open | blocked
     http_status: Optional[int] = None
     final_url: str = ""
     content_type: str = ""
@@ -48,10 +48,72 @@ class FetchResult:
     from_cache: bool = False
     fetched_at: str = ""
     elapsed_ms: Optional[int] = None
+    # salvage: even a 403 answers with headers (platform fingerprints — a
+    # Shopify store identifies itself on its block page) and an error body.
+    # error_body is NEVER treated as page content — fingerprinting only.
+    headers: Dict[str, str] = field(default_factory=dict)
+    error_body: str = ""
 
     @property
     def ok(self) -> bool:
         return self.status in ("ok", "cached") and bool(self.html)
+
+
+# HTTP statuses that mean "a wall, not a failure": the origin answered and
+# will keep answering the same way — retrying only hammers it. 429 is the
+# one retried, once, when Retry-After fits inside the wall-clock budget.
+_BLOCK_STATUSES = {401, 403, 406, 451}
+
+# A realistic desktop-browser header profile. Many CDNs 403 unknown
+# User-Agent strings at the edge before the origin ever sees the request;
+# presenting normal browser headers avoids that naive block. This changes
+# *presentation only* — robots.txt compliance, rate limits, the per-domain
+# circuit breaker and the hard wall-clock cap all still apply.
+_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+_MAX_ERROR_BODY = 4096       # bytes of a non-ok body kept for fingerprinting
+_MAX_HEADERS = 40            # response headers captured per fetch
+
+
+def _parse_retry_after(value: str) -> Optional[float]:
+    """RFC 9110 Retry-After: delta-seconds OR an HTTP-date. None when absent
+    or unparseable — the caller then falls back to normal backoff retries."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(value)
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        return None
+
+
+def _capture_headers(resp) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for i, (k, v) in enumerate(resp.headers.items()):
+        if i >= _MAX_HEADERS:
+            break
+        out[str(k).lower()] = str(v)[:300]
+    return out
 
 
 def _now() -> str:
@@ -142,7 +204,8 @@ class Fetcher:
                                final_url=d.get("final_url", url),
                                content_type=d.get("content_type", ""),
                                html=d.get("html", ""), from_cache=True,
-                               fetched_at=d.get("fetched_at", ""))
+                               fetched_at=d.get("fetched_at", ""),
+                               headers=dict(d.get("headers") or {}))
         except Exception:
             return None
 
@@ -154,7 +217,7 @@ class Fetcher:
             with open(_cache_path(self.cfg, res.url), "w", encoding="utf-8") as fh:
                 json.dump({"http_status": res.http_status, "final_url": res.final_url,
                            "content_type": res.content_type, "html": res.html,
-                           "fetched_at": res.fetched_at}, fh)
+                           "fetched_at": res.fetched_at, "headers": res.headers}, fh)
         except Exception:
             pass
 
@@ -184,7 +247,10 @@ class Fetcher:
     def _robots_ok(self, url: str, u) -> bool:
         if not self.cfg.respect_robots:
             return True
-        host = f"{u.scheme or 'https'}://{u.host}"
+        from urllib.parse import urlsplit
+        netloc = urlsplit(url if "://" in url else "http://" + url).netloc or u.host
+        host = f"{u.scheme or 'https'}://{netloc}"   # keep the port — robots
+                                                     # lives on the same origin
         with self._lock:
             cached = self._robots.get(host, "unset")
         if cached == "unset":
@@ -219,8 +285,12 @@ class Fetcher:
         with self._lock:
             if self._session is None:
                 self._session = requests.Session()
-                self._session.headers.update({"User-Agent": self.cfg.user_agent,
-                                              "Accept": "text/html,application/xhtml+xml"})
+                if getattr(self.cfg, "browser_headers", False):
+                    self._session.headers.update(_BROWSER_HEADERS)
+                else:
+                    self._session.headers.update(
+                        {"User-Agent": self.cfg.user_agent,
+                         "Accept": "text/html,application/xhtml+xml"})
         return self._session
 
     def _online(self, url: str) -> FetchResult:
@@ -255,6 +325,12 @@ class Fetcher:
 
         backoff = self.cfg.retry_backoff
         last_err = ""
+        # salvage from the most recent answered attempt: headers + a bounded
+        # error-body excerpt survive into the final result even when the fetch
+        # ultimately fails — a 403's headers still fingerprint the platform
+        last_hdrs: Dict[str, str] = {}
+        last_body = ""
+        last_status: Optional[int] = None
         for attempt in range(self.cfg.max_retries + 1):
             if time.monotonic() >= deadline:
                 last_err = last_err or f"hard_timeout ({self.cfg.hard_timeout:.0f}s) exceeded"
@@ -265,21 +341,24 @@ class Fetcher:
                 remaining = max(0.5, deadline - time.monotonic())
                 resp = self._session.get(url, timeout=min(self.cfg.timeout, remaining),
                                          stream=True, allow_redirects=True)
+                hdrs = _capture_headers(resp)
                 ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
-                if ctype and not any(ctype == a for a in self.cfg.allowed_content_types):
+                if resp.ok and ctype and not any(ctype == a for a in self.cfg.allowed_content_types):
                     resp.close()
                     self._record_outcome(domain, ok=True)
                     return FetchResult(url=url, status="skipped", http_status=resp.status_code,
                                        final_url=str(resp.url), content_type=ctype,
-                                       error="non-html content-type", fetched_at=_now())
+                                       error="non-html content-type", fetched_at=_now(),
+                                       headers=hdrs)
                 chunks, total, truncated = [], 0, ""
+                body_cap = self.cfg.max_bytes if resp.ok else _MAX_ERROR_BODY
                 for chunk in resp.iter_content(chunk_size=16384, decode_unicode=False):
                     if not chunk:
                         continue
                     chunks.append(chunk)
                     total += len(chunk)
-                    if total >= self.cfg.max_bytes:
-                        truncated = f"truncated at {total} bytes (max_bytes)"
+                    if total >= body_cap:
+                        truncated = f"truncated at {total} bytes (max_bytes)" if resp.ok else ""
                         break
                     if time.monotonic() >= deadline:
                         truncated = f"truncated at {total} bytes (hard_timeout)"
@@ -287,25 +366,54 @@ class Fetcher:
                 raw = b"".join(chunks)
                 encoding = resp.encoding or "utf-8"
                 html = raw.decode(encoding, errors="replace")
-                res = FetchResult(
-                    url=url, status="ok" if resp.ok else "error",
-                    http_status=resp.status_code, final_url=str(resp.url),
-                    content_type=ctype or "text/html", html=html if resp.ok else "",
-                    error=truncated if resp.ok else f"HTTP {resp.status_code}",
-                    fetched_at=_now(), elapsed_ms=int((time.monotonic() - t0) * 1000))
+                status_code = resp.status_code
+                final_url = str(resp.url)
                 resp.close()
-                if res.ok:
+                if resp.ok:
+                    res = FetchResult(
+                        url=url, status="ok", http_status=status_code,
+                        final_url=final_url, content_type=ctype or "text/html",
+                        html=html, error=truncated, fetched_at=_now(),
+                        elapsed_ms=int((time.monotonic() - t0) * 1000),
+                        headers=hdrs)
                     self._write_cache(res)
                     self._record_outcome(domain, ok=True)
                     return res
-                last_err = res.error
+                last_hdrs, last_status = hdrs, status_code
+                last_body = html[:_MAX_ERROR_BODY]
+                last_err = f"HTTP {status_code}"
+                if status_code in _BLOCK_STATUSES:
+                    # a wall answers the same way every time — do not hammer it
+                    self._record_outcome(domain, ok=False)
+                    return FetchResult(url=url, status="blocked", http_status=status_code,
+                                       final_url=final_url, content_type=ctype,
+                                       error=last_err, fetched_at=_now(),
+                                       headers=hdrs, error_body=last_body)
+                if status_code == 429:
+                    ra = _parse_retry_after(hdrs.get("retry-after", ""))
+                    if ra is not None:
+                        # honor the server's own pacing when it fits the budget
+                        if attempt < self.cfg.max_retries \
+                                and time.monotonic() + ra < deadline:
+                            time.sleep(ra)
+                            continue
+                        self._record_outcome(domain, ok=False)
+                        return FetchResult(url=url, status="blocked",
+                                           http_status=status_code,
+                                           final_url=final_url, content_type=ctype,
+                                           error=last_err, fetched_at=_now(),
+                                           headers=hdrs, error_body=last_body)
+                    # no usable Retry-After: give it the normal backoff retries;
+                    # the loop's final failure return keeps the salvage
             except Exception as exc:  # network / timeout
                 last_err = f"{type(exc).__name__}: {exc}"
             if attempt < self.cfg.max_retries and time.monotonic() < deadline:
                 time.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
                 backoff *= 2
         self._record_outcome(domain, ok=False)
-        return FetchResult(url=url, status="error", error=last_err, fetched_at=_now())
+        return FetchResult(url=url, status="error", http_status=last_status,
+                           error=last_err, fetched_at=_now(),
+                           headers=last_hdrs, error_body=last_body)
 
     # -- public ------------------------------------------------------------ #
     def fetch(self, url: str) -> FetchResult:

@@ -56,6 +56,7 @@ from .config import ScrapeConfig
 from .directory import directory_content, lookup
 from .extract import PageContent, extract_page
 from .fetch import Fetcher, FetchResult, _cache_path, _now, base_url_of
+from .fingerprint import detect_platform
 from .products import extract_products, match_products
 from .schema import (PAGE_SCHEMA, PRODUCT_SCHEMA, finalize_from_parts,
                      next_part_seq, page_row, part_column_values, product_rows,
@@ -178,8 +179,11 @@ def _prior_for(cfg: ScrapeConfig, row: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # URL tokens already decide these completely, and they carry nothing worth
 # extracting (no products on a cart, no prose on a SERP) — fetching them buys
-# nothing but rate-limit seconds.
-_NEVER_FETCH_SUBTYPES = {"cart", "checkout", "order", "wishlist", "serp", "site_search"}
+# nothing but rate-limit seconds. Service-routed tool/account/maps surfaces
+# (docs.google.com, accounts.*, maps.*) are auth walls or JS shells: equally
+# not worth a fetch.
+_NEVER_FETCH_SUBTYPES = {"cart", "checkout", "order", "wishlist", "serp",
+                         "site_search", "tool", "account", "local"}
 
 
 def _fetch_decision(url: str, cfg: ScrapeConfig, domain_budget: Dict[str, int]) -> Tuple[bool, str]:
@@ -193,10 +197,15 @@ def _fetch_decision(url: str, cfg: ScrapeConfig, domain_budget: Dict[str, int]) 
         return True, ""
     if cfg.fetch_policy == "never":
         return False, "fetch_policy=never"
+    import dataclasses
+
     from .classify import classify_rule
     from .extract import PageContent
 
-    sub = classify_rule(PageContent(url=url), url, cfg).page_subtype
+    # URL-decided means decided by the RULES: the fetch gate must not depend
+    # on (or trigger training of) the learned model
+    url_cfg = dataclasses.replace(cfg, use_learned_model=False)
+    sub = classify_rule(PageContent(url=url), url, url_cfg).page_subtype
     if sub in _NEVER_FETCH_SUBTYPES:
         return False, f"smart policy: '{sub}' is URL-decided"
     dom = parse_url(url).registrable or url
@@ -232,10 +241,16 @@ def _save_profiles(cfg: ScrapeConfig, profiles: Dict[str, dict]) -> None:
 
 def _learn_profile(profiles: Dict[str, dict], pr: dict) -> None:
     """Fold one content-bearing page row into its domain's profile."""
-    if pr.get("fetch_scope") not in ("page", "base"):
-        return
     dom = pr.get("domain")
     if not dom:
+        return
+    # the platform fingerprint is learnable from ANY row that carried one —
+    # including blocked fetches — so once a bot-walled domain's circuit opens,
+    # its remaining URLs still classify with the platform evidence
+    if pr.get("server_platform"):
+        prof = profiles.setdefault(dom, {"relevance": 0.0, "seller": "na", "n_pages": 0})
+        prof.setdefault("platform", pr["server_platform"])
+    if pr.get("fetch_scope") not in ("page", "base"):
         return
     p = profiles.setdefault(dom, {"relevance": 0.0, "seller": "na", "n_pages": 0})
     p["relevance"] = round(max(float(p.get("relevance", 0.0)),
@@ -296,10 +311,20 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
         profile = None
         if cfg.use_domain_profiles and profiles and scope != "page":
             profile = profiles.get(parse_url(url).registrable)
+        # hosting-platform fingerprint: works from the response headers (which
+        # even a 403 answers with) and the body — a bot-walled Shopify store
+        # still classifies as a storefront. When this fetch carried nothing
+        # (circuit_open, robots_blocked), the domain profile remembers the
+        # platform learned from the domain's earlier responses.
+        platform = detect_platform(getattr(fr, "headers", None),
+                                   fr.html or getattr(fr, "error_body", ""))
+        if not platform and profiles:
+            platform = str((profiles.get(parse_url(url).registrable) or {})
+                           .get("platform", "") or "")
         cls = classify_page(content, url, cfg, prior=_prior_for(cfg, row_d),
                             n_products=len(products), chat_brands=chat_brands,
                             domain_profile=profile, directory_entry=entry,
-                            content_scope=scope)
+                            content_scope=scope, platform=platform)
         if scope == "base":
             cls.signals = [s for s in cls.signals if s != "content"] + ["base_content"]
         elif scope == "directory":
@@ -308,6 +333,12 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
         match_products(products, cls.primary_brand, mentions, message_id=str(mid),
                        coincide_threshold=cfg.coincide_threshold,
                        name_threshold=cfg.match_name_threshold)
+        # page ↔ chat connection, rolled up to the page grain: the best match
+        # tier among this page's products vs the surfacing turns' mentions
+        order = {"none": 0, "likely": 1, "strong": 2, "exact": 3}
+        best = max(products, default=None,
+                   key=lambda p: (order.get(p.match_strength, 0), p.match_score))
+        chat_match = (best.match_strength, best.match_score) if best else ("none", 0.0)
         # where the raw HTML lives on disk (the per-URL fetch cache), so any
         # page can be re-inspected / re-classified without re-fetching
         html_path = ""
@@ -318,7 +349,7 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
                 if os.path.exists(p):
                     html_path = p
         pr = page_row(row_d, fr, content, cls, len(products), fetch_scope=scope,
-                      html_path=html_path)
+                      html_path=html_path, platform=platform, chat_match=chat_match)
         return pr, product_rows(pr["page_id"], url, products)
     except Exception as exc:
         err = FetchResult(url=url, status=fr.status, http_status=fr.http_status,

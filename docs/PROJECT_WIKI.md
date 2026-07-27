@@ -153,10 +153,16 @@ trajectory, brands discussed/recommended, max stage reached, the collapsed
 Every URL from the three link columns is classified into a funnel-mapped
 taxonomy — `brand_landing`, `catalogue`, `shopping` (with `seller_type`:
 brand-owned vs retailer), `editorial`, `search`, `community`, `reference`,
-`unrelated`, `unknown` — by a **multimodal rule scorer**: URL tokens, domain
-knowledge, page markup (schema.org / OpenGraph), and any vendor prior each
-vote; any one can carry a page alone. The **fallback chain** guarantees
-coverage:
+`unrelated`, `unknown` — by a **multimodal scorer**: URL tokens,
+**service-aware platform routing** (docs.google.com is a tool, maps.google
+is a places surface, shopping.google is a marketplace — never blanket
+"search"), domain knowledge, page markup (schema.org / OpenGraph), any
+vendor prior, the **hosting-platform fingerprint** from response headers
+(a bot-walled Shopify store still reads as a storefront), and a
+**self-trained model** (multinomial logistic over hashed features, trained
+on the synthetic ground truth and self-trainable on your own parquet with
+`python -m conveyer.scraping.model train --pages …`) each vote; any one
+channel can carry a page alone. The **fallback chain** guarantees coverage:
 
 1. fetch the page itself (`fetch_scope="page"`);
 2. if unreachable, fetch the **base URL** — `x.com/…/status/…` → `x.com/` —
@@ -175,10 +181,19 @@ after a vocabulary update, `python -m conveyer.scraping.validate <pages>
 HTML without re-scraping (the haircare-conditioner fix).
 
 Product metadata (name, brand, price, rating, SKU) is extracted from
-schema.org/OG/microdata and matched back to the chat's brand mentions
-(`coincides`). Operationally the scraper is built for 100k+ URL runs: obeys
-robots.txt (with bounded timeouts), per-domain rate limiting that never
-blocks other domains, a hard wall-clock cap per URL, caching, and
+schema.org/OG/microdata and matched back to the chat's mentions with
+**precision-first tiers** (`match_strength`: exact / strong / likely / none —
+only exact/strong count as `coincides`; brand alone never does, and brand or
+attribute conflicts like SPF 30 vs 60 veto the match). Long-tail brands
+connect through the mention's own words ("the JBCA conditioner" ↔ a JBCA
+PDP), typos through character-trigram similarity, and each page carries the
+roll-up (`chat_match_strength`) — the page ↔ chat-product connection at the
+page grain. Operationally the scraper is built for 100k+ URL runs: obeys
+robots.txt (with bounded timeouts) while presenting realistic browser
+headers (naive UA blocks don't fire; on a real block nothing is retried and
+the response headers are salvaged for the platform fingerprint), per-domain
+rate limiting that never blocks other domains, a hard wall-clock cap per
+URL, caching, and
 line-by-line JSONL persistence with resume — interrupt any time, rerun, it
 continues. **Domains are never re-worked**: a circuit breaker skips domains
 that only fail; the smart fetch policy (default online) never fetches

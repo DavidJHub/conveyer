@@ -107,7 +107,8 @@ code("""
 art = run_pipeline(
     ConversationConfig(data_path=str(ROOT / "data/conversations.parquet"),
                        synthetic_n_sessions=40, out_dir=str(OUT / "conversations")),
-    ScrapeConfig(offline=True, out_dir=str(OUT / "scrape"), progress_every=0),
+    ScrapeConfig(offline=True, out_dir=str(OUT / "scrape"), progress_every=0,
+                 model_path=str(OUT / "scrape" / "page_model.npz")),
     JourneyConfig(conversion_stage="cart", out_dir=str(OUT / "journey")),
 )
 turns = art["conversations"]["turns_out"]

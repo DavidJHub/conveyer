@@ -140,17 +140,53 @@ barh(axes[2], convs["journey_path"].value_counts().head(6), "Top journey paths")
 plt.tight_layout(); plt.show()
 """)
 
+md("""
+### 2.1 How the agent responds to similar prompts
+
+Grouping turns by **intent** (and by HMM journey stage) shows the agent's
+behaviour under similar prompts: how often it volunteers a recommendation
+(`reco_rate` = share of turns with an *unsolicited* brand), how positive its
+answers read, and how many links it surfaces. This is the supply side of the
+funnel — what the agent injects, before the user does anything with it.
+""")
+
+code("""
+def _n(x):
+    return len(x) if hasattr(x, "__len__") and not isinstance(x, str) else 0
+
+t = turns.assign(recommends=turns["brands_unsolicited"].map(_n) > 0,
+                 n_brands=turns["brands_a"].map(_n))
+by_intent = (t.groupby("intent")
+             .agg(turns=("message_id", "count"),
+                  reco_rate=("recommends", "mean"),
+                  answer_sentiment=("answer_sentiment", "mean"),
+                  brands_per_answer=("n_brands", "mean"),
+                  links_cited=("n_links_cited", "mean"))
+             .round(2).sort_values("reco_rate", ascending=False))
+display(by_intent)
+by_stage = (t.groupby("journey_stage")
+            .agg(turns=("message_id", "count"), reco_rate=("recommends", "mean"),
+                 answer_sentiment=("answer_sentiment", "mean"),
+                 links_cited=("n_links_cited", "mean"))
+            .round(2).sort_values("reco_rate", ascending=False))
+by_stage
+""")
+
 # ---------------------------------------------------------------------------- #
 md("""
 ## 3 · Module 2 — where the user landed
 
-Every URL from `a_links_source` / `ai_click` / `next_10_urls`, classified into
-the funnel-mapped taxonomy. The **fallback chain** means nothing stays
-unclassified: page content when fetchable → the **base URL's** content when
-not (`fetch_scope="base"`: `x.com/…/status/…` → `x.com/`) → URL + domain
-heuristics alone (an unfetchable `amazon.com/gp/cart/…` is still
-`shopping · cart · retailer · Purchase`). Details + deep dive:
-[`02_page_classifier.ipynb`](02_page_classifier.ipynb).
+Every URL from `a_links_source` / `ai_click` / `next_10_urls`, classified by
+**eight independent evidence channels** — URL tokens, service routing
+(`docs.google.com` is a tool, never "search"), curated domain lists, page
+markup, the vendor prior, the offline domain directory, the hosting-platform
+fingerprint (a bot-walled Shopify store still reads as a storefront) and a
+**self-trained model** (`python -m conveyer.scraping.model train`). The
+**fallback chain** means nothing stays unclassified: page content when
+fetchable → the **base URL's** content when not → URL + domain heuristics
+alone (an unfetchable `amazon.com/gp/cart/…` is still
+`shopping · cart · retailer · Purchase`). Deep dive + classifier behaviour
+analysis: [`02_page_classifier.ipynb`](02_page_classifier.ipynb).
 """)
 
 code("""
@@ -159,7 +195,38 @@ barh(axes[0], pages["page_category"].value_counts(), "Pages by category")
 barh(axes[1], pages["fetch_scope"].value_counts(), "Content source (fallback chain)", hue=HUE2)
 plt.tight_layout(); plt.show()
 pages[["url", "page_category", "page_subtype", "seller_type", "funnel_stage",
-       "fetch_scope", "classification_signals"]].sample(6, random_state=1)
+       "chat_match_strength", "classification_signals"]].sample(6, random_state=1)
+""")
+
+md("""
+### 3.1 Which links get the attention
+
+Link relevancy from behaviour, three reads: **dwell** (time until the next
+request in the trail — an upper bound on attention), **trail position** (how
+early after the answer the page was opened) and the **page↔chat connection**
+(`chat_match_strength`: does this page carry the very product the agent
+mentioned?). The interesting cross-read: do pages matching the agent's
+recommendation hold attention longer than unmatched ones?
+""")
+
+code("""
+trail = pages[pages["mean_dwell_seconds"].notna()]
+by_cat = (trail.groupby("page_category")
+          .agg(pages=("url", "count"), mean_dwell_s=("mean_dwell_seconds", "mean"),
+               mean_position=("mean_trail_position", "mean"),
+               relevant_share=("is_study_relevant", "mean"))
+          .round(2).sort_values("mean_dwell_s", ascending=False))
+display(by_cat)
+
+by_match = (trail.groupby(trail["chat_match_strength"].replace("", "none"))
+            .agg(pages=("url", "count"), mean_dwell_s=("mean_dwell_seconds", "mean"),
+                 total_dwell_s=("total_dwell_seconds", "sum"),
+                 visits=("times_visited", "sum")).round(2))
+display(by_match)
+
+top = trail.sort_values("total_dwell_seconds", ascending=False)
+top[["url", "page_category", "funnel_stage", "chat_match_strength",
+     "times_visited", "total_dwell_seconds", "mean_trail_position"]].head(8)
 """)
 
 # ---------------------------------------------------------------------------- #
@@ -259,6 +326,61 @@ for s in ("top", "right"):
 ax.tick_params(colors=INK, labelsize=9)
 plt.tight_layout(); plt.show()
 model["coefficients"]        # both models, long form (also written to parquet)
+""")
+
+md("""
+### 4.5 When is a client susceptible to the agent's recommendation?
+
+The lift of `followed_recommendation` recomputed **within segments** of the
+conversation: who converts more when they follow the agent, relative to peers
+in the same segment who didn't? Segments come from module 1's conversation
+features — did the user *ask* for recommendations, how positive the exchange
+read, how long the conversation ran, how deep the stated funnel stage went.
+High lift + high follow-rate = the moments the agent's word carries the most
+weight. (Observational, synthetic-validated — on real data these cells
+produce the real profile. CIs on small segments are wide; read direction,
+not decimals.)
+""")
+
+code("""
+f = features.copy()
+segs = []
+def seg(mask, name):
+    g = f[mask]
+    fol, not_ = g[g["followed_recommendation"]], g[~g["followed_recommendation"]]
+    if len(g) < 4 or not len(fol) or not len(not_):
+        return
+    a, b = fol["converted"].mean(), not_["converted"].mean()
+    segs.append({"segment": name, "sessions": len(g),
+                 "follow_rate": round(len(fol) / len(g), 2),
+                 "conv_followed": round(a, 2), "conv_not_followed": round(b, 2),
+                 "lift": round(a / b, 2) if b > 0 else np.inf})
+
+med_ask = f["asks_recommendation_share"].median()
+med_sent = f["mean_answer_sentiment"].median()
+med_turns = f["n_turns"].median()
+seg(f["asks_recommendation_share"] > med_ask,  "asks for recommendations (high)")
+seg(f["asks_recommendation_share"] <= med_ask, "asks for recommendations (low)")
+seg(f["mean_answer_sentiment"] > med_sent,     "positive answer sentiment")
+seg(f["mean_answer_sentiment"] <= med_sent,    "neutral/negative answer sentiment")
+seg(f["n_turns"] > med_turns,                  "long conversations")
+seg(f["n_turns"] <= med_turns,                 "short conversations")
+seg(f["max_funnel_stage_idx"] >= 3,            "reached Intent+ in conversation")
+seg(f["max_funnel_stage_idx"] < 3,             "stayed Awareness/Evaluation")
+seg(f["visited_recommended_brand"],            "visited a recommended brand")
+susceptibility = pd.DataFrame(segs)
+display(susceptibility)
+
+fig, ax = plt.subplots(figsize=(8, 3.6))
+s = susceptibility.replace(np.inf, np.nan).dropna(subset=["lift"]).sort_values("lift")
+ax.barh(s["segment"], s["lift"], color=HUE2, height=0.6)
+ax.axvline(1.0, color=INK, lw=0.9, ls="--")
+ax.set_title("Conversion lift of following the agent, by segment (1.0 = no effect)",
+             fontsize=10.5, color=INK, loc="left")
+for sp in ("top", "right"):
+    ax.spines[sp].set_visible(False)
+ax.tick_params(colors=INK, labelsize=9)
+plt.tight_layout(); plt.show()
 """)
 
 # ---------------------------------------------------------------------------- #

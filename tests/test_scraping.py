@@ -996,6 +996,53 @@ def test_query_strip_fallback():
            f"shell must not prove off-topic: {pr6['page_category']}")
 
 
+def test_editorial_slug_url_only():
+    """Comparison/question/explainer slugs must classify editorial from the
+    URL alone — zicail answers bots with a challenge shell, so
+    /eye-cream-vs-eye-serum/ has to be carried by its slug."""
+    from conveyer.scraping.classify import _url_subtype_votes, parse_url
+    cfg = ScrapeConfig(use_learned_model=False)
+    cases = [
+        "https://www.zicail.com/eye-cream-vs-eye-serum/?preview_id=23376&preview_nonce=c00df61de2&preview=true",
+        "https://www.zicail.com/eye-cream-vs-eye-serum/",
+        "https://glowjournal.example/what-is-niacinamide/",
+        "https://beautynotes.example/benefits-of-hyaluronic-acid/",
+    ]
+    for u in cases:
+        r = classify_rule(extract_page("", u), u, cfg)
+        _check(r.page_category == "editorial" and r.page_subtype == "article",
+               f"{u} -> {r.page_category}/{r.page_subtype}")
+        _check(r.funnel_stage == "Evaluation" and r.is_study_relevant,
+               f"{u} -> {r.funnel_stage}, relevant={r.is_study_relevant}")
+    # relevance still gates: an off-topic comparison on an unknown domain
+    # keeps the article READING but not an invented on-topic category
+    off = "https://techblog.example/playstation-vs-xbox-which-to-buy/"
+    r = classify_rule(extract_page("", off), off, cfg)
+    _check(r.page_category == "unknown" and not r.is_study_relevant,
+           f"off-topic comparison -> {r.page_category}")
+    # '-vs-' needs a word on both sides: a /vs-pink brand line earns nothing
+    votes = _url_subtype_votes(parse_url("https://shop.example.com/vs-pink"))
+    _check("article" not in votes, f"vs-pink guard: {votes}")
+    # the learned model knows the slug shapes standalone (distilled), and a
+    # stale model file (old feature_version) retrains itself transparently
+    import numpy as np
+    import conveyer.scraping.model as M
+    out = tempfile.mkdtemp(prefix="conveyer_modelver_")
+    try:
+        path = os.path.join(out, "m.npz")
+        with open(path, "wb") as fh:      # old-format file: no feature_version
+            np.savez_compressed(fh, coef=np.zeros((2, 8), dtype=np.float32),
+                                intercept=np.zeros(2, dtype=np.float32),
+                                classes=np.array(["pdp", "serp"]), dim=np.int64(8))
+        m = M._model_for(ScrapeConfig(model_path=path, model_autotrain=True))
+        _check(m is not None and m.dim == M.DEFAULT_DIM, "stale model retrained")
+        probs = m.predict_proba_one(M.featurize("https://www.zicail.com/eye-cream-vs-eye-serum/"))
+        _check(max(probs, key=probs.get) == "article",
+               f"model top class {max(probs, key=probs.get)}")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def test_fingerprint_detection():
     from conveyer.scraping.fingerprint import (detect_platform,
                                                is_commerce_platform)

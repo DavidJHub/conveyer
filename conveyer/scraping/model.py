@@ -53,6 +53,9 @@ from .config import ScrapeConfig
 from .extract import PageContent, extract_page
 
 DEFAULT_DIM = 2 ** 16
+# bump when featurize() changes: a model trained on old features would read
+# arbitrary weights for the new ones — a mismatched file retrains itself
+FEATURE_VERSION = 2
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _TRAIN_LOCK = threading.Lock()
 _FAILED_PATHS: set = set()
@@ -80,6 +83,14 @@ def featurize(url: str, page: Optional[PageContent] = None,
     f += [f"qk:{k.split('=', 1)[0][:20]}" for k in u.query.split("&") if k][:6]
     if not segs:
         f.append("path:root")
+    # slug SHAPE — the blog-permalink / comparison / question signatures that
+    # identify informational articles from the URL alone
+    if len(segs) == 1 and segs[0].count("-") >= 2:
+        f.append("shape:root_slug")
+    if re.search(r"[a-z0-9]-vs-[a-z0-9]", u.path):
+        f.append("shape:vs")
+    if re.search(r"(^|/)(what|why|how|when|which|should|does|do|is|can)-", u.path):
+        f.append("shape:question")
     if prior_page_type:
         f.append(f"prior:{prior_page_type.lower()}")
     if platform:
@@ -147,13 +158,18 @@ class PageModel:
         tmp = path + ".tmp"
         with open(tmp, "wb") as fh:
             np.savez_compressed(fh, coef=self.coef, intercept=self.intercept,
-                                classes=np.array(self.classes), dim=np.int64(self.dim))
+                                classes=np.array(self.classes), dim=np.int64(self.dim),
+                                feature_version=np.int64(FEATURE_VERSION))
         os.replace(tmp, path)
         return path
 
     @classmethod
     def load(cls, path: str) -> "PageModel":
         with np.load(path, allow_pickle=False) as z:
+            version = int(z["feature_version"]) if "feature_version" in z else 1
+            if version != FEATURE_VERSION:
+                raise ValueError(f"model feature_version {version} != "
+                                 f"{FEATURE_VERSION} (featurize changed — retrain)")
             return cls(z["coef"], z["intercept"],
                        [str(c) for c in z["classes"]], int(z["dim"]))
 
@@ -251,6 +267,35 @@ def _service_distillation() -> List[Tuple[List[str], str]]:
     return out
 
 
+def _editorial_slug_distillation() -> List[Tuple[List[str], str]]:
+    """Comparison / question / explainer slugs on blogs the lists don't know
+    — the class of URL the corpus surfaces constantly
+    (zicail.com/eye-cream-vs-eye-serum/) and the curated channels miss."""
+    slugs = [
+        "eye-cream-vs-eye-serum", "retinol-vs-retinal-which-is-better",
+        "day-cream-vs-night-cream", "cleanser-vs-face-wash",
+        "what-is-niacinamide", "what-are-ceramides",
+        "why-your-moisturizer-pills", "when-to-apply-sunscreen",
+        "benefits-of-hyaluronic-acid", "difference-between-toner-and-essence",
+        "how-often-should-you-exfoliate", "sunscreen-myths-debunked",
+        "skincare-routine-mistakes", "double-cleansing-explained",
+    ]
+    domains = ["zicail.com", "glowjournal.example", "beautynotes.example"]
+    out = [(featurize(f"https://www.{d}/{s}/"), "article")
+           for d in domains for s in slugs]
+    # counterweight: the SAME beauty vocabulary under /product(s)/ is a PDP —
+    # the path segment decides, the tokens must not drag product pages
+    # into 'article'
+    pdp_slugs = ["gentle-eye-cream", "hydrating-eye-serum",
+                 "daily-face-moisturizer", "vitamin-c-serum",
+                 "night-repair-cream", "brightening-eye-cream"]
+    out += [(featurize(f"https://www.{d}/products/{s}"), "pdp")
+            for d in domains for s in pdp_slugs]
+    out += [(featurize(f"https://www.{d}/product/{s}"), "pdp")
+            for d in domains for s in pdp_slugs[:3]]
+    return out
+
+
 def _transactional_distillation() -> List[Tuple[List[str], str]]:
     domains = ["amazon.com", "sephora.com", "target.com", "boots.co.uk",
                "brandstore.example"]
@@ -284,7 +329,8 @@ def build_training_samples(pages_parquet: Optional[str] = None,
             y.append(label)
         X.append(featurize(url))
         y.append(label)
-    for feats, label in _service_distillation() + _transactional_distillation():
+    for feats, label in (_service_distillation() + _transactional_distillation()
+                         + _editorial_slug_distillation()):
         X.append(feats)
         y.append(label)
 

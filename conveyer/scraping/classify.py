@@ -495,6 +495,26 @@ def _url_subtype_votes(u: UrlParts) -> Dict[str, float]:
     elif re.search(r"(^|/|-)best-[a-z0-9]", path) or \
             re.search(r"(^|/)how-to-[a-z0-9]", path):
         add("article", 1.5)
+    # comparison / question / explainer slugs — the classic informational
+    # article signature: /eye-cream-vs-eye-serum/, /what-is-niacinamide/,
+    # /benefits-of-retinol/. The -vs- token needs a word on BOTH sides so
+    # /vs-pink (a brand line) never counts.
+    if re.search(r"[a-z0-9]-vs-[a-z0-9]", path) or re.search(
+            r"difference-between|what-(is|are)-|why-(you|your|is|do|does)-|"
+            r"when-to-|which-[a-z0-9]+-(is|to)-|should-(you|i)-|"
+            r"do(es)?-you-need|benefits-of-|(^|/|-)benefits(/|-|$)|"
+            r"guide-to-|-explained(/|-|$)|-myths(/|-|$)|-mistakes(/|-|$)|"
+            r"can-you-use|is-it-(safe|worth|ok)", path):
+        add("article", 1.6)
+    # WordPress-permalink shape: one root-level slug of 3+ hyphenated words
+    # and no commerce token is how blogs publish articles. Weak vote, and not
+    # on curated retailer/marketplace domains (their root slugs are merch
+    # landing pages, not posts).
+    segs = [s for s in path.strip("/").split("/") if s]
+    if (len(segs) == 1 and segs[0].count("-") >= 2
+            and u.core not in RETAILER_DOMAINS and u.core not in MARKETPLACE_DOMAINS
+            and not re.search(r"product|item|shop|cart|checkout|sku", segs[0])):
+        add("article", 0.9)
     if re.search(r"/(wiki|health|conditions?|how-to|howto|learn|ingredient)(/|$)", path):
         add("wiki", 1.2)
     return v
@@ -745,11 +765,12 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
         prior_cat = getattr(directory_entry, "category", "") or ""
 
     if not votes:
+        rel0 = _topical_relevance(page, u, chat_brands, prior_cat,
+                                  tuple(cfg.extra_relevance_terms or ()))
         return PageClass(page_category="unknown", page_subtype="other",
                          confidence=0.0, method="rule", signals=signals,
-                         skincare_relevance=_topical_relevance(
-                             page, u, chat_brands, prior_cat,
-                             tuple(cfg.extra_relevance_terms or ())))
+                         skincare_relevance=rel0,
+                         is_study_relevant=rel0 >= 0.15)
 
     subtype = max(votes, key=votes.get)
     # decisive transactional URL tokens win the subtype outright: prices and

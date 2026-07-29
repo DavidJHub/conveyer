@@ -1,0 +1,7 @@
+
+# Notebooks are GENERATED (notebooks/_build_notebook_*.py --execute) and full
+# of volatile JSON (execution counts, random cell ids, timestamps). Git must
+# never text-merge them — that produces conflict-marker soup inside JSON.
+# Marked binary: a conflict becomes a whole-file choice; resolve by keeping
+# either side, then regenerate: python notebooks/_build_notebook_01.py --execute
+*.ipynb -text -diff -merge linguist-generated=true

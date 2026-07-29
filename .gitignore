@@ -221,3 +221,6 @@ __marimo__/
 /data/*
 !/data/README.md
 /outputs/
+
+# notebook demo artefacts
+/notebooks/outputs/

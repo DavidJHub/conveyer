@@ -165,9 +165,14 @@ on the synthetic ground truth and self-trainable on your own parquet with
 channel can carry a page alone. The **fallback chain** guarantees coverage:
 
 1. fetch the page itself (`fetch_scope="page"`);
-2. if unreachable, fetch the **base URL** — `x.com/…/status/…` → `x.com/` —
+2. if the exact link fails, retry it **without its query string** — a stale
+   `?preview_id=…&preview_nonce=…` errors while the bare article loads; same
+   document, counts as the page's own content (`"stripped"`; never fires on
+   content-selecting queries like `?q=` or `?variant=`);
+3. still failing, fetch the **base URL** — `x.com/…/status/…` → `x.com/` —
    and classify from base content + the original URL's tokens (`"base"`);
-3. else URL + domain heuristics alone (`"none"`) — an unfetchable
+4. else the offline domain directory's description (`"directory"`), and
+   finally URL + domain heuristics alone (`"none"`) — an unfetchable
    `amazon.com/gp/cart/view.html?ref_=nav_cart` still reads
    `shopping · cart · retailer · Purchase`.
 

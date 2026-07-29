@@ -55,7 +55,8 @@ from .classify import (PageClass, classify_page, is_transactional_url,
 from .config import ScrapeConfig
 from .directory import directory_content, lookup
 from .extract import PageContent, extract_page
-from .fetch import Fetcher, FetchResult, _cache_path, _now, base_url_of
+from .fetch import (Fetcher, FetchResult, _cache_path, _now, base_url_of,
+                    query_stripped_url)
 from .fingerprint import detect_platform
 from .products import extract_products, match_products
 from .schema import (PAGE_SCHEMA, PRODUCT_SCHEMA, finalize_from_parts,
@@ -250,7 +251,7 @@ def _learn_profile(profiles: Dict[str, dict], pr: dict) -> None:
     if pr.get("server_platform"):
         prof = profiles.setdefault(dom, {"relevance": 0.0, "seller": "na", "n_pages": 0})
         prof.setdefault("platform", pr["server_platform"])
-    if pr.get("fetch_scope") not in ("page", "base"):
+    if pr.get("fetch_scope") not in ("page", "stripped", "base"):
         return
     p = profiles.setdefault(dom, {"relevance": 0.0, "seller": "na", "n_pages": 0})
     p["relevance"] = round(max(float(p.get("relevance", 0.0)),
@@ -270,23 +271,38 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
 
     Fallback chain (the classifier's multimodal design does the rest):
     1. the page itself (``fetch_scope="page"``);
-    2. the **base URL** (``scheme://host/``) when the deep link is unreachable —
+    2. the page **minus its query string** when the exact link fails — stale
+       ``?preview_id=…&preview_nonce=…`` tokens error while the bare article
+       loads. The stripped variant is the SAME document, so its content
+       counts as the page's own (``fetch_scope="stripped"``); never fires
+       when the query selects the content (?q=, ?variant=, ?asin=…);
+    3. the **base URL** (``scheme://host/``) when the deep link is unreachable —
        x.com/…/status/… → x.com/ — so domain-level content still informs
        relevance/category (``fetch_scope="base"``; cache makes this ~free since
        base pages repeat across thousands of deep links);
-    3. the **domain directory** when nothing is fetchable at all —
+    4. the **domain directory** when nothing is fetchable at all —
        robots_blocked, bot walls, dead hosts — the directory's description of
        the site stands in as domain-level content (``fetch_scope="directory"``;
        see :mod:`conveyer.scraping.directory`);
-    4. URL + domain heuristics alone (``fetch_scope="none"``).
+    5. URL + domain heuristics alone (``fetch_scope="none"``).
     """
     url = row_d.get("url") or fr.url
     try:
         scope = "page" if fr.ok else "none"
-        base = ""
+        base = stripped = ""
+        fr_content = fr          # the fetch that actually supplied the content
         content = extract_page(fr.html, url=url, parser=cfg.html_parser) if fr.ok \
             else PageContent(url=url)
-        if not fr.ok and cfg.base_fallback and allow_base:
+        if not fr.ok and getattr(cfg, "query_strip_fallback", True):
+            stripped = query_stripped_url(url)
+            if stripped:
+                frs = fetcher.fetch(stripped)
+                if frs.ok:
+                    content = extract_page(frs.html, url=url, parser=cfg.html_parser)
+                    scope, fr_content = "stripped", frs
+                else:
+                    stripped = ""
+        if scope == "none" and cfg.base_fallback and allow_base:
             base = base_url_of(url)
             if base:
                 frb = fetcher.fetch(base)
@@ -299,13 +315,14 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
             # is known — its directory description stands in as content
             content = directory_content(entry, url)
             scope = "directory"
-        # products only from the page itself — a homepage's or the directory's
+        # products only from the page's own document (the query-stripped
+        # variant IS the same document) — a homepage's or the directory's
         # markup must not be attributed to a deep link it stands in for; and on
         # transactional URLs (cart/checkout) the text-price heuristic is off,
         # so cart furniture can't become a phantom product
         products = extract_products(content, cfg.max_products_per_page,
                                     include_heuristic=not is_transactional_url(url)) \
-            if scope == "page" else []
+            if scope in ("page", "stripped") else []
         chat_brands = chat_brands_for(row_d, src.mentions)
         mentions = mentions_for(row_d, src.mentions)
         profile = None
@@ -318,6 +335,9 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
         # platform learned from the domain's earlier responses.
         platform = detect_platform(getattr(fr, "headers", None),
                                    fr.html or getattr(fr, "error_body", ""))
+        if not platform and fr_content is not fr:
+            platform = detect_platform(getattr(fr_content, "headers", None),
+                                       fr_content.html)
         if not platform and profiles:
             platform = str((profiles.get(parse_url(url).registrable) or {})
                            .get("platform", "") or "")
@@ -329,6 +349,8 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
             cls.signals = [s for s in cls.signals if s != "content"] + ["base_content"]
         elif scope == "directory":
             cls.signals = [s for s in cls.signals if s != "content"] + ["directory_content"]
+        elif scope == "stripped":
+            cls.signals = cls.signals + ["query_stripped"]
         mid = (row_d.get("message_ids") or [""])[0]
         match_products(products, cls.primary_brand, mentions, message_id=str(mid),
                        coincide_threshold=cfg.coincide_threshold,
@@ -343,7 +365,7 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
         # page can be re-inspected / re-classified without re-fetching
         html_path = ""
         if cfg.use_cache:
-            src_url = url if scope == "page" else (base if scope == "base" else "")
+            src_url = {"page": url, "stripped": stripped, "base": base}.get(scope, "")
             if src_url:
                 p = _cache_path(cfg, src_url)
                 if os.path.exists(p):

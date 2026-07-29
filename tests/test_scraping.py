@@ -913,6 +913,61 @@ def test_browser_headers_and_robots_compliance():
         srv.shutdown()
 
 
+def test_query_strip_fallback():
+    """A stale-query link (?preview_id=…&preview_nonce=…) that errors must be
+    retried WITHOUT its query; the stripped variant's content counts as the
+    page's own (fetch_scope='stripped'). Identity-bearing queries (?q=,
+    ?variant=…) must never be stripped — that would fetch a different page."""
+    from conveyer.scraping.fetch import query_stripped_url
+    from conveyer.scraping.pipeline import _process_one
+    from conveyer.scraping.sources import ScrapeSources
+
+    full = ("https://www.zicail.com/how-to-choose-the-best-sunscreen/"
+            "?preview_id=10472&preview_nonce=fd5902c163")
+    bare = "https://www.zicail.com/how-to-choose-the-best-sunscreen/"
+    _check(query_stripped_url(full) == bare, f"strip -> {query_stripped_url(full)}")
+    _check(query_stripped_url(bare) == "", "nothing to strip")
+    _check(query_stripped_url("https://www.google.com/search?q=retinol") == "",
+           "?q= selects the content — never stripped")
+    _check(query_stripped_url("https://shop.example.com/p/x?variant=123") == "",
+           "?variant= selects the content")
+    _check(query_stripped_url("https://example.com/?utm_source=chat") == "",
+           "root stripping is the base fallback's job")
+    _check(query_stripped_url("https://www.byrdie.com/best-spf/?utm_source=chatgpt.com")
+           == "https://www.byrdie.com/best-spf/", "tracking params strip fine")
+
+    article = ('<html lang="en"><head><title>How to Choose the Best Sunscreen</title>'
+               '<meta name="description" content="SPF, broad spectrum and skin type — '
+               'how to pick a sunscreen."><meta property="og:type" content="article">'
+               '<script type="application/ld+json">{"@type":"Article",'
+               '"headline":"How to Choose the Best Sunscreen"}</script></head>'
+               '<body><h1>How to Choose the Best Sunscreen</h1>'
+               '<p>Dermatologists recommend SPF 30+ broad spectrum sunscreen, '
+               'reapplied every two hours. Mineral vs chemical sunscreen.</p></body></html>')
+    cfg2 = ScrapeConfig(offline=True, use_learned_model=False, use_cache=False)
+    # the corpus knows ONLY the bare URL — the full link is an offline_miss,
+    # exactly like the live 'preview nonce expired' error page
+    fetcher = Fetcher(cfg2, html_by_url={bare: article})
+    src = ScrapeSources(urls=pd.DataFrame([{"url": full}]), mentions={})
+    fr = fetcher.fetch(full)
+    _check(not fr.ok, f"the full link must fail first: {fr.status}")
+    pr, prods = _process_one(cfg2, src, {"url": full, "message_ids": []}, fr, fetcher)
+    _check(pr["fetch_scope"] == "stripped", f"scope {pr['fetch_scope']}")
+    _check(pr["page_category"] == "editorial" and pr["page_subtype"] == "article",
+           f"{pr['page_category']}/{pr['page_subtype']}")
+    _check(pr["is_study_relevant"], "sunscreen article is on-topic")
+    _check("query_stripped" in list(pr["classification_signals"]),
+           f"audited: {pr['classification_signals']}")
+    _check(pr["title"].startswith("How to Choose"), "content came from the stripped URL")
+    # with the fallback disabled the same link stays content-less
+    cfg3 = ScrapeConfig(offline=True, use_learned_model=False, use_cache=False,
+                        query_strip_fallback=False, base_fallback=False,
+                        directory_fallback=False)
+    f3 = Fetcher(cfg3, html_by_url={bare: article})
+    pr3, _ = _process_one(cfg3, src, {"url": full, "message_ids": []}, f3.fetch(full), f3)
+    _check(pr3["fetch_scope"] == "none", f"knob off -> {pr3['fetch_scope']}")
+
+
 def test_fingerprint_detection():
     from conveyer.scraping.fingerprint import (detect_platform,
                                                is_commerce_platform)

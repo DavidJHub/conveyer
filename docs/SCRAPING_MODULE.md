@@ -260,10 +260,19 @@ how *skincare-related* the page is. The two axes then combine with care:
 `pipeline.py::_process_one`, recorded in `fetch_scope`:
 
 1. `page` — the page itself was fetched: all voters play.
-2. `base` — the deep link failed (bot wall, 404) → fetch the site's homepage
+2. `stripped` — the exact link failed → retry it **without its query
+   string**: a stale `…/how-to-choose-the-best-sunscreen/?preview_id=10472&preview_nonce=…`
+   errors while the bare article loads. The stripped variant is the *same
+   document*, so its content counts as the page's own — it can prove
+   relevance or `unrelated`, and products ARE extracted. Guard: never fires
+   when the query *selects* the content (`?q=`, `?variant=`, `?asin=`,
+   `?page=`, `?v=` …) — stripping those would fetch a different page. Audited
+   as `query_stripped` in `classification_signals`; knob:
+   `query_strip_fallback` (default on).
+3. `base` — still failing → fetch the site's homepage
    (`scheme://host/`) so domain-level content still informs the label.
    Products are **not** extracted from the stand-in homepage.
-3. `directory` — nothing fetchable at all (**`robots_blocked`**, bot wall on
+4. `directory` — nothing fetchable at all (**`robots_blocked`**, bot wall on
    the homepage too, dead host) → the **domain directory**
    (`directory.py`) supplies a stored *description of the site* that stands
    in as content: "Sephora — specialty beauty retailer selling skincare,
@@ -274,7 +283,7 @@ how *skincare-related* the page is. The two axes then combine with care:
    touching code. Stand-in descriptions supply *relevance*, but can never
    prove a page `unrelated`, never yield products, and never mint a category
    the URL didn't structurally earn (`sephora.com/careers` stays `unknown`).
-4. `none` — no directory entry either: URL tokens + domain lists + vendor
+5. `none` — no directory entry either: URL tokens + domain lists + vendor
    prior alone. An unreachable cart on an unheard-of domain is still,
    correctly, a cart.
 

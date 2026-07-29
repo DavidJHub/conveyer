@@ -682,8 +682,9 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     :mod:`conveyer.scraping.directory`): its role votes when the curated
     domain lists are silent, and its site category stands in for the vendor
     prior. ``content_scope`` says whose words ``page`` carries — "page" (its
-    own), "base" (the base URL's), "directory" (the entry's description) or
-    "none": only the page's OWN content may prove it unrelated.
+    own), "stripped" (the query-stripped variant of the same document — also
+    its own), "base" (the base URL's), "directory" (the entry's description)
+    or "none": only the page's OWN content may prove it unrelated.
     ``platform`` is the hosting-platform fingerprint from the response headers
     (see :mod:`conveyer.scraping.fingerprint`) — a Shopify/WooCommerce store
     is storefront evidence even when the page itself was bot-walled."""
@@ -708,8 +709,9 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
         "directory": {} if (svc is not None or domain_votes)
         else _directory_votes(directory_entry, u),
         # the model sees only what training saw: the page's OWN content or the
-        # bare URL — never a base-page/directory stand-in (train/serve match)
-        "model": _model_votes(page if content_scope == "page" else None,
+        # bare URL — never a base-page/directory stand-in (train/serve match).
+        # The query-stripped variant IS the page's own document.
+        "model": _model_votes(page if content_scope in ("page", "stripped") else None,
                               url, cfg, platform),
     }
     votes: Dict[str, float] = {}
@@ -829,7 +831,7 @@ def classify_rule(page: PageContent, url: str, cfg: ScrapeConfig,
     # /checkouts/c/<token> is still a checkout. A page whose only support is
     # the weak retailer catch-all (sephora.com/careers) tells us nothing — and
     # a domain description alone must not mint a category for it → unknown.
-    real_content = has_content and content_scope == "page"
+    real_content = has_content and content_scope in ("page", "stripped")
     final_category = category
     if category != "unknown":
         if not is_relevant:

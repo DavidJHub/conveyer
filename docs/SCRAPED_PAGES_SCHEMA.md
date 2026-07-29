@@ -178,7 +178,7 @@ erDiagram
 | `fetched_at` | string | UTC ISO timestamp |
 | `fetch_error` | string | error detail when `fetch_status != ok` |
 | `from_cache` | bool | served from the on-disk fetch cache |
-| `fetch_scope` | string | where the content came from: `page` (the URL itself) · `base` (**base-URL fallback** — the deep link was unreachable, so `scheme://host/` was fetched instead and stands in for domain-level evidence; `x.com/…/status/…` → `x.com/`) · `directory` (**domain-directory fallback** — nothing was fetchable, the offline directory's description of the domain stands in) · `none` (URL/domain heuristics only) |
+| `fetch_scope` | string | where the content came from: `page` (the URL itself) · `stripped` (**query-strip fallback** — the exact link failed, the URL minus its query string loaded; a stale `?preview_id=…&preview_nonce=…` errors while the bare article works. Same document, so it counts as the page's OWN content; never fires when the query selects the content — ?q=, ?variant=, ?asin=…) · `base` (**base-URL fallback** — the deep link was unreachable, so `scheme://host/` was fetched instead and stands in for domain-level evidence; `x.com/…/status/…` → `x.com/`) · `directory` (**domain-directory fallback** — nothing was fetchable, the offline directory's description of the domain stands in) · `none` (URL/domain heuristics only) |
 | `parser` | string | `stdlib` or `bs4` (auto-upgrades when installed) · `directory` for directory stand-ins |
 | `html_path` | string | where the raw HTML used for this row lives on disk (the per-URL fetch-cache file; the base URL's file when `fetch_scope="base"`); empty when nothing was fetched or caching is off |
 | `response_headers` | string (JSON) | the response headers, captured on OK fetches **and** on blocks — "anything can be useful for the model" |
@@ -208,7 +208,7 @@ erDiagram
 | `seller_type` | string | `brand_owned · retailer · na` |
 | `funnel_stage` | string | Awareness … Post-Purchase / Irrelevant |
 | `classifier_method` | string | `rule · rule+prior · llm · error`, plus repair suffixes `+url_validated` / `+reclassified` when a later pass fixed the row |
-| `classification_signals` | list\<string\> | modalities that fired: `url · service · domain · markup · platform · model · content · base_content · directory · domain_profile · prior · llm · url_override · url_validated · reclassified` |
+| `classification_signals` | list\<string\> | modalities that fired: `url · service · domain · markup · platform · model · content · base_content · directory · domain_profile · prior · llm · url_override · query_stripped · url_validated · reclassified` |
 | `skincare_relevance` | float64 | 0–1 **beauty / personal-care** topical score — skincare, haircare, bodycare and cosmetics keywords + brands, in content **and** URL slugs. The column name predates the wider vocabulary and is kept for schema stability; extend the lexicon per run via `ScrapeConfig.extra_relevance_terms` |
 | `is_study_relevant` | bool | `skincare_relevance ≥ 0.15`, or journey infrastructure (topic-neutral subtype on a known domain) |
 | `primary_brand` | string | page-intrinsic brand (brand domain or `product:brand`) |

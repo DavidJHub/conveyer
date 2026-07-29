@@ -75,6 +75,15 @@ class ScrapeConfig:
     cache_dir: str = "outputs/scrape_cache"
     use_cache: bool = True
     allowed_content_types: Tuple[str, ...] = ("text/html", "application/xhtml+xml")
+    query_strip_fallback: bool = True    # when a deep link fails, retry it
+                                         # WITHOUT its query string first —
+                                         # stale ?preview_id=…&preview_nonce=…
+                                         # tokens break pages that load fine
+                                         # bare. Never fires when the query
+                                         # selects the content (?q=, ?variant=,
+                                         # ?asin=…); the result counts as the
+                                         # page's OWN content (fetch_scope
+                                         # "stripped")
     base_fallback: bool = True           # when a deep link is unreachable, fetch
                                          # scheme://host/ and classify from the
                                          # base page + the original URL's tokens

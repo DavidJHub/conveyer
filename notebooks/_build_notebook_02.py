@@ -37,7 +37,10 @@ shows where it slots in):
 1. **Scrape** each URL — politely *and block-resiliently*: robots.txt +
    rate limits + wall-clock caps, a realistic browser header profile, and when
    a bot wall answers anyway, everything it *did* give us (response headers,
-   platform fingerprint) is salvaged for the classifier (§7).
+   platform fingerprint) is salvaged for the classifier (§7). A link that
+   fails on a stale query (`?preview_id=…&preview_nonce=…`) is retried
+   **without the query** first (`fetch_scope="stripped"`) — the bare article
+   usually loads, and it is the same document.
 2. **Classify** the page with **eight independent evidence channels** — URL
    tokens, *service routing* (§4), curated domain lists, page markup, the
    vendor prior, the offline domain directory, the *hosting-platform

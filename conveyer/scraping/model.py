@@ -304,7 +304,7 @@ def build_training_samples(pages_parquet: Optional[str] = None,
             if str(row.get("page_category")) == "unknown":
                 continue
             pc, scope, _src = _content_for_row(row, cfg)
-            page = pc if scope == "page" else None
+            page = pc if scope in ("page", "stripped") else None
             X.append(featurize(str(row.get("url") or ""), page,
                                str(row.get("prior_page_type") or ""),
                                str(row.get("server_platform") or "")))

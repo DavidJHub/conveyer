@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional
 from urllib import robotparser
+from urllib.parse import urlsplit, urlunsplit
 
 from .classify import parse_url
 from .config import ScrapeConfig
@@ -129,6 +130,39 @@ def base_url_of(url: str) -> str:
         return ""
     base = f"{u.scheme or 'https'}://{u.host}/"
     return "" if base.rstrip("/") == str(url).rstrip("/") else base
+
+
+# Query keys that SELECT the content rather than track the visit: stripping
+# them would fetch a DIFFERENT page (?q= is the search, ?variant= the SKU,
+# ?page= the pagination slice, ?v= the video). Exact key match — preview_id
+# is stripping-safe even though it contains "id".
+_IDENTITY_QUERY_KEYS = {"q", "k", "p", "query", "search", "keyword", "page",
+                        "variant", "variant_id", "sku", "productid", "pid",
+                        "asin", "id", "itemid", "item", "v", "t", "tag"}
+
+
+def query_stripped_url(url: str) -> str:
+    """The URL minus its query string and fragment — the first fallback when
+    the exact link fails. Stale preview tokens, session nonces and tracking
+    params routinely break otherwise-fine pages
+    (``…/how-to-choose-the-best-sunscreen/?preview_id=10472&preview_nonce=…``
+    errors while the bare article loads). Returns "" when there is nothing to
+    strip, when the query carries identity-bearing keys whose removal would
+    change WHICH page this is, or when stripping just yields the site root
+    (that is the base-URL fallback's job)."""
+    try:
+        s = urlsplit(url if "://" in url else "https://" + url)
+    except ValueError:
+        return ""
+    if not s.hostname or not s.query:
+        return ""
+    keys = {p.split("=", 1)[0].strip().lower() for p in s.query.split("&") if p}
+    if keys & _IDENTITY_QUERY_KEYS:
+        return ""
+    path = s.path or "/"
+    if path.strip("/") == "":
+        return ""
+    return urlunsplit((s.scheme or "https", s.netloc, path, "", ""))
 
 
 def _cache_path(cfg: ScrapeConfig, url: str) -> str:

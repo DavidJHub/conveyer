@@ -184,10 +184,12 @@ markup, the vendor prior, the offline domain directory, the hosting-platform
 fingerprint (a bot-walled Shopify store still reads as a storefront) and a
 **self-trained model** (`python -m conveyer.scraping.model train`). The
 **fallback chain** means nothing stays unclassified: page content when
-fetchable → the **base URL's** content when not → URL + domain heuristics
-alone (an unfetchable `amazon.com/gp/cart/…` is still
-`shopping · cart · retailer · Purchase`). Deep dive + classifier behaviour
-analysis: [`02_page_classifier.ipynb`](02_page_classifier.ipynb).
+fetchable → the same URL **minus a broken query string**
+(`?preview_id=…&preview_nonce=…` errors; the bare article loads — same
+document, own content) → the **base URL's** content → the domain directory →
+URL + domain heuristics alone (an unfetchable `amazon.com/gp/cart/…` is
+still `shopping · cart · retailer · Purchase`). Deep dive + classifier
+behaviour analysis: [`02_page_classifier.ipynb`](02_page_classifier.ipynb).
 """)
 
 code("""

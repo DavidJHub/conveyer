@@ -424,7 +424,68 @@ poststratification), not row-by-row.
 
 ---
 
-## 4 · Gotchas checklist (both datasets)
+## 4 · Derived dataset — scraped pages (`conveyer.pages` → `outputs/scraped/`)
+
+The URLs in the clickstream tables (`surfaced_url`, `dim_digital_site.url`,
+`next_10_urls`, `a_links_source`) are scraped, classified and product-parsed
+by [`conveyer/pages.py`](../conveyer/pages.py) (CLI:
+`python -m conveyer.pages --urls <file> --url-col url --out outputs/scraped`).
+The fetcher honours robots.txt, rate-limits per domain and caches HTML, so
+re-runs are incremental.
+
+### 4.1 Page taxonomy (funnel-aware)
+
+| `page_class` | Maps to funnel stage | Examples / signals |
+|---|---|---|
+| `brand_landing` | Discovery | brand-owned domain root, `Organization`/`WebSite` JSON-LD |
+| `catalogue_page` | Discovery | `ItemList`/`CollectionPage`, product grids, /collections/ paths |
+| `search_results` | Discovery | search engines, `?q=` site search |
+| `review_editorial` | Evaluation | `Article` JSON-LD, "best X / review / vs" titles + long text |
+| `forum_social` | Evaluation | reddit, youtube, tiktok, instagram, quora |
+| `product_page` | Intent | single `Product` JSON-LD with offer, add-to-cart + /product/ URL |
+| `checkout_or_cart` | Purchase | /cart, /checkout URLs and titles |
+| `ai_assistant` | — | chatgpt.com, perplexity.ai (the chat itself) |
+| `unrelated` | — | none of the above |
+
+`ownership` further splits shopping pages into `brand_owned` / `retailer` /
+`marketplace` / `unknown` (brand-domain match against the chat's brand
+lexicon + curated retailer/marketplace lists). Every label ships with
+`class_confidence` and a `class_evidence` trail.
+
+### 4.2 `scraped_pages.parquet` (grain = one URL)
+
+`page_id` (sha1-16 of url, PK) · `url` · `final_url` · `domain` · `fetched_at`
+· `http_status` · `fetch_error` · `content_type` · `page_class` ·
+`funnel_stage` · `ownership` · `class_confidence` · `class_evidence` · `title`
+· `meta_description` · `og_type` · `og_site_name` · `canonical_url` ·
+`language` · `h1` · `n_links` · `n_images` · `n_product_links` ·
+`n_price_signals` · `has_add_to_cart` · `jsonld_types` · `n_jsonld_products`
+· `text_chars` · `text_snippet`
+
+### 4.3 `scraped_products.parquet` (grain = one product found on a page)
+
+`page_id` (FK) · `url` · `message_id` (FK → search_turn, when the URL came
+from a turn) · `source` (jsonld / microdata / og_meta) · `name` · `brand` ·
+`description` · `price` · `price_currency` · `availability` · `rating_value`
+· `rating_count` · `category` · `sku` · `image_url`
+
+### 4.4 `product_entity_matches.parquet` (grain = one product ↔ best chat entity)
+
+`page_id` · `message_id` · `product_name` · `product_brand` ·
+`matched_entity` (from `fact_ai_recommendation.entity_context`) ·
+`matched_entity_brand` · `name_similarity` (0–1, char-ratio + token-overlap
+blend) · `brand_match` (bool) · `coincides` (bool: similarity ≥ 0.55, or
+brand match with ≥ 0.35 name support)
+
+This closes the loop the clickstream leaves open (its `recommendation_id` is
+never populated): a visited URL whose on-page product `coincides` with a
+recommended entity is **entity-level attribution evidence**, and the extracted
+price/rating/category feed the Q6 utility model and Q7 conversion GLM with
+*real* product metadata instead of synthesized values.
+
+---
+
+## 5 · Gotchas checklist (both datasets)
 
 1. `fact_ai_concept.fact_id` joins to `recommendation_id`, **not** `message_id`
    (vendor doc is wrong).

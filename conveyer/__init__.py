@@ -11,9 +11,11 @@ Public API:
     graphs       user x session x entity interaction network
     attribution  Bayesian conversion, MRP extrapolation, MMM, MNL utility
                  model, Shapley explanations
+    pages        URL scraping, funnel-aware page classifier, on-page product
+                 extraction and product<->chat-entity matching (parquet out)
 """
 from . import (aces, analysis, attribution, augment, clustering, funnel,
-               graphs, ingest, models, viz)
+               graphs, ingest, models, pages, viz)
 from .config import PipelineConfig
 from .pipeline import run_pipeline
 
@@ -30,6 +32,7 @@ __all__ = [
     "funnel",
     "graphs",
     "attribution",
+    "pages",
 ]
 
 __version__ = "0.2.0"

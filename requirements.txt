@@ -6,6 +6,9 @@ pyarrow>=12.0
 scipy>=1.10
 networkx>=3.0            # interaction network (conveyer.graphs)
 matplotlib>=3.7          # notebook figures
+requests>=2.31           # page scraping (conveyer.pages)
+beautifulsoup4>=4.12     # HTML parsing (conveyer.pages)
+lxml>=4.9                # fast bs4 backend
 
 # Embeddings — pick at least one backend (auto-resolved, best first)
 voyageai>=0.3            # voyage-3-large (Anthropic-recommended, best English embeddings)

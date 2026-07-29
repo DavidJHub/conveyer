@@ -44,6 +44,10 @@ conveyer/                     the Python package
   graphs.py                   user x session x entity network, direct/indirect exposure (Q2)
   attribution.py              Bayesian conversion (Q3), MRP extrapolation (Q4), MMM (Q5),
                               conditional-logit utility model (Q6), exact Shapley (Q8)
+  pages.py                    polite URL scraper + funnel-aware page classifier (brand landing /
+                              catalogue / PDP / checkout / editorial / social / search / AI / unrelated),
+                              on-page product extraction (price, rating, category via JSON-LD,
+                              microdata, OG) and product<->chat-entity matching; parquet outputs
 
 notebooks/
   01_text_clustering_pipeline.ipynb   conversation clustering & segment characterisation

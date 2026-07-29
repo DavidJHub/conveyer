@@ -262,13 +262,20 @@ how *skincare-related* the page is. The two axes then combine with care:
 1. `page` — the page itself was fetched: all voters play.
 2. `stripped` — the exact link failed → retry it **without its query
    string**: a stale `…/how-to-choose-the-best-sunscreen/?preview_id=10472&preview_nonce=…`
-   errors while the bare article loads. The stripped variant is the *same
+   errors while the bare article loads. "Failed" includes **soft errors**:
+   an HTTP-successful response that is really an error page — a WordPress
+   preview-nonce failure (200 + "not allowed to preview" or a `wp-login`
+   redirect) or an anti-bot **challenge shell** (202 + a couple hundred
+   bytes of script). A soft-error body is *never* classified as the page's
+   content: if the stripped variant is healthy it takes over; otherwise the
+   shell is dropped and the chain continues below (a "Page not found" title
+   must not label a page `unrelated`). Near-empty bodies are also never
+   cached, so recoveries self-heal. The stripped variant is the *same
    document*, so its content counts as the page's own — it can prove
    relevance or `unrelated`, and products ARE extracted. Guard: never fires
    when the query *selects* the content (`?q=`, `?variant=`, `?asin=`,
-   `?page=`, `?v=` …) — stripping those would fetch a different page. Audited
-   as `query_stripped` in `classification_signals`; knob:
-   `query_strip_fallback` (default on).
+   `?page=`, `?v=` …). Audited as `query_stripped` in
+   `classification_signals`; knob: `query_strip_fallback` (default on).
 3. `base` — still failing → fetch the site's homepage
    (`scheme://host/`) so domain-level content still informs the label.
    Products are **not** extracted from the stand-in homepage.

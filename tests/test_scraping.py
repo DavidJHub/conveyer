@@ -967,6 +967,34 @@ def test_query_strip_fallback():
     pr3, _ = _process_one(cfg3, src, {"url": full, "message_ids": []}, f3.fetch(full), f3)
     _check(pr3["fetch_scope"] == "none", f"knob off -> {pr3['fetch_scope']}")
 
+    # THE WORDPRESS CASE: the preview link does not fail at the HTTP level —
+    # it returns 200 with the ERROR PAGE as the body (or redirects to
+    # wp-login). The soft-error detector must still trigger the strip.
+    err_page = ('<html lang="en"><head><title>Page not found - Zicail</title></head>'
+                '<body><h1>Sorry, you are not allowed to preview drafts.</h1>'
+                '<p>Please log in and try again.</p></body></html>')
+    f4 = Fetcher(cfg2, html_by_url={full: err_page, bare: article})
+    fr4 = f4.fetch(full)
+    _check(fr4.ok, "the soft-error fetch LOOKS successful")
+    pr4, _ = _process_one(cfg2, src, {"url": full, "message_ids": []}, fr4, f4)
+    _check(pr4["fetch_scope"] == "stripped" and pr4["page_category"] == "editorial",
+           f"soft error rescued: {pr4['fetch_scope']}/{pr4['page_category']}")
+    _check(pr4["title"].startswith("How to Choose"), "error shell replaced by the article")
+    # a legit page with a strippable query is never second-guessed
+    f5 = Fetcher(cfg2, html_by_url={full: article, bare: err_page})
+    pr5, _ = _process_one(cfg2, src, {"url": full, "message_ids": []}, f5.fetch(full), f5)
+    _check(pr5["fetch_scope"] == "page", f"healthy page untouched: {pr5['fetch_scope']}")
+    # anti-bot challenge shells (202 + a few bytes) on BOTH variants: the
+    # shell must never be classified as the page's content — it is dropped
+    # and the URL slug still carries the topical/structural verdict
+    shell = "<html><head><script>challenge()</script></head><body></body></html>"
+    f6 = Fetcher(cfg2, html_by_url={full: shell, bare: shell})
+    pr6, _ = _process_one(cfg2, src, {"url": full, "message_ids": []}, f6.fetch(full), f6)
+    _check(pr6["fetch_scope"] not in ("page", "stripped"),
+           f"challenge shell is not content: {pr6['fetch_scope']}")
+    _check(pr6["page_category"] != "unrelated",
+           f"shell must not prove off-topic: {pr6['page_category']}")
+
 
 def test_fingerprint_detection():
     from conveyer.scraping.fingerprint import (detect_platform,

@@ -246,6 +246,11 @@ class Fetcher:
     def _write_cache(self, res: FetchResult) -> None:
         if not self.cfg.use_cache:
             return
+        # never cache near-empty bodies: JS-challenge interstitials (202 +
+        # ~200 bytes) would otherwise replay as this URL's "content" forever,
+        # long after the site stops challenging
+        if len(res.html) < 512:
+            return
         os.makedirs(self.cfg.cache_dir, exist_ok=True)
         try:
             with open(_cache_path(self.cfg, res.url), "w", encoding="utf-8") as fh:

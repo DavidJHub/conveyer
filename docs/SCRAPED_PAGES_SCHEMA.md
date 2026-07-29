@@ -155,7 +155,7 @@ erDiagram
 
 ---
 
-## 3 · `fact_scraped_page` — 61 columns (grain = one URL)
+## 3 · `fact_scraped_page` — 62 columns (grain = one URL)
 
 ### Identity & URL parts
 

@@ -490,6 +490,11 @@ def _url_subtype_votes(u: UrlParts) -> Dict[str, float]:
     if re.search(r"/(blog|article|news|reviews?|guide|guides|best|stories|tips)(/|$)", path) or \
        re.search(r"best-.*-for|-review(s)?(-|/|$)|top-\d+", path):
         add("article", 1.8)
+    # editorial slugs where the token sits INSIDE the hyphenated slug:
+    # /how-to-choose-the-best-sunscreen/ carries both markers
+    elif re.search(r"(^|/|-)best-[a-z0-9]", path) or \
+            re.search(r"(^|/)how-to-[a-z0-9]", path):
+        add("article", 1.5)
     if re.search(r"/(wiki|health|conditions?|how-to|howto|learn|ingredient)(/|$)", path):
         add("wiki", 1.2)
     return v

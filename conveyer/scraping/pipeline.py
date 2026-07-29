@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
@@ -166,6 +167,34 @@ def _recover_state(cfg: ScrapeConfig) -> Tuple[set, int]:
 # --------------------------------------------------------------------------- #
 # Core run
 # --------------------------------------------------------------------------- #
+# An "ok" fetch that is actually an error shell: WordPress preview links with
+# a stale nonce 302 to wp-login.php or 200 a "not allowed to preview" page —
+# the HTTP layer says success while the document says error. Detected from
+# the final URL (auth redirects) and the title/H1 (error phrases on a thin
+# page), and ONLY consulted when a strippable query exists — a legit page is
+# never second-guessed without one.
+_SOFT_ERROR_RE = re.compile(
+    r"page not found|not found|does not exist|error 4\d\d|\b40[1348]\b|"
+    r"forbidden|access denied|not allowed|not permitted|log ?in|sign ?in|"
+    r"session (has )?expired|link (has )?expired|"
+    r"invalid (link|request|nonce|token|preview)|preview (unavailable|expired)|"
+    r"something went wrong|are you lost", re.IGNORECASE)
+_LOGIN_PATH_TOKENS = ("wp-login", "/login", "/signin", "/sign-in", "/sso/", "/auth/")
+
+
+def _soft_error_page(fr: FetchResult, content: PageContent) -> bool:
+    final = str(getattr(fr, "final_url", "") or "").lower()
+    if any(t in final for t in _LOGIN_PATH_TOKENS):
+        return True
+    # a near-empty shell: JS challenge / queued-page interstitial (some
+    # anti-bot layers answer HTTP 202 with ~200 bytes of script) — nothing a
+    # classifier could use, and NOT this document's words
+    if content.word_count < 25 and not content.title and not content.jsonld:
+        return True
+    head = " ".join([content.title] + content.h1[:2])
+    return bool(_SOFT_ERROR_RE.search(head)) and content.word_count < 300
+
+
 def _prior_for(cfg: ScrapeConfig, row: dict) -> dict:
     return {
         cfg.col_page_type: row.get("page_type"),
@@ -293,15 +322,27 @@ def _process_one(cfg: ScrapeConfig, src: ScrapeSources, row_d: dict,
         fr_content = fr          # the fetch that actually supplied the content
         content = extract_page(fr.html, url=url, parser=cfg.html_parser) if fr.ok \
             else PageContent(url=url)
-        if not fr.ok and getattr(cfg, "query_strip_fallback", True):
+        # the exact link failed OUTRIGHT (4xx/5xx/dead), or it "succeeded"
+        # into a soft error (WordPress preview nonce → 200 error page or a
+        # wp-login redirect): either way, retry without the query string
+        soft_error = fr.ok and _soft_error_page(fr, content)
+        if (not fr.ok or soft_error) and getattr(cfg, "query_strip_fallback", True):
             stripped = query_stripped_url(url)
             if stripped:
                 frs = fetcher.fetch(stripped)
-                if frs.ok:
-                    content = extract_page(frs.html, url=url, parser=cfg.html_parser)
-                    scope, fr_content = "stripped", frs
+                cand = extract_page(frs.html, url=url, parser=cfg.html_parser) \
+                    if frs.ok else None
+                # adopt the stripped document unless it is just as broken —
+                # a soft-error original only yields to a NON-error replacement
+                if cand is not None and not _soft_error_page(frs, cand):
+                    content, scope, fr_content = cand, "stripped", frs
                 else:
                     stripped = ""
+        if soft_error and scope != "stripped":
+            # an error/challenge shell is NOT this document's content — a
+            # "Page not found" title must never classify the page unrelated.
+            # Drop it and let base/directory/URL heuristics take over.
+            content, scope = PageContent(url=url), "none"
         if scope == "none" and cfg.base_fallback and allow_base:
             base = base_url_of(url)
             if base:

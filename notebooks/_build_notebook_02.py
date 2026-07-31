@@ -113,10 +113,16 @@ content fetches per domain), `domain_failure_threshold` (circuit breaker),
 
 **Matching** — `coincide_threshold` (score gate) — but note `coincides` now
 also requires an **exact/strong tier** (§9).
+
+**Persistence / resume** — `out_dir` holds everything a run owns (commit logs,
+parquet parts, final tables, domain profiles, run manifest); `resume=True`
+skips URLs already in the commit log; `checkpoint_every` sets how often the
+buffer is flushed to a part file. `prepare_run` below is what makes re-running
+this notebook a *continuation* rather than a restart (§2).
 """)
 
 code("""
-import shutil, sys, warnings
+import os, sys, warnings
 from pathlib import Path
 
 import numpy as np
@@ -129,11 +135,14 @@ while not (ROOT / "conveyer").is_dir() and ROOT != ROOT.parent:
 sys.path.insert(0, str(ROOT))
 warnings.filterwarnings("ignore")
 
-from conveyer.scraping import ScrapeConfig, run_scrape, CATEGORY_DEFINITIONS
+from conveyer.scraping import ScrapeConfig, run_scrape, prepare_run, CATEGORY_DEFINITIONS
 
 DATA = ROOT / "data/conversations.parquet"
 OUT = ROOT / "outputs/scrape_demo"
-shutil.rmtree(OUT, ignore_errors=True)   # fresh demo run (no resume from old outputs)
+
+# Re-running this notebook CONTINUES the run in OUT instead of restarting it.
+# Export CONVEYER_FRESH=1 to discard the accumulated run and start clean.
+FRESH = os.environ.get("CONVEYER_FRESH", "0").strip().lower() not in ("0", "", "false", "no")
 
 cfg = ScrapeConfig(
     clickstream_dir=str(DATA),        # a single parquet file is enough
@@ -146,8 +155,12 @@ cfg = ScrapeConfig(
     max_urls=2000,
     checkpoint_every=200,
     progress_every=25,
-    resume=True,
+    resume=True,                      # skip URLs the commit log already vouches for
 )
+
+# decides new / resume / fresh, and refuses to merge a *different* input into
+# an existing table (see §2)
+print(prepare_run(cfg, fresh=FRESH).message)
 HUE, HUE2, INK = "#4878a8", "#c17a3f", "#444444"
 pd.set_option("display.max_colwidth", 60)
 
@@ -165,7 +178,7 @@ def barh(ax, counts, title, hue=HUE):
 """)
 
 md("""
-## 2 · Run the pipeline — incremental, interruption-safe
+## 2 · Run the pipeline — incremental, interruption-safe, **resumable**
 
 One call: resolve sources → stream fetches → extract / classify / match **as
 each URL completes** → append to the JSONL sidecars line by line → refresh
@@ -175,20 +188,62 @@ Why it cannot run forever or lose work, by construction: every URL has a hard
 wall-clock budget; the rate limiter sleeps outside the lock; results stream
 `as_completed`; domains are never re-worked (circuit breaker + smart fetch
 policy + learned domain profiles); products are written first and the page
-line last (a **commit marker**), so a crash loses at most the page in flight
-and the next run resumes. The first `[model]` line below is the learned
-channel autotraining once (§5).
+line last (a **commit marker**), so a crash loses at most the page in flight.
+The first `[model]` line below is the learned channel autotraining once (§5).
+
+**Re-running is a resume, not a restart.** `run_scrape` skips every URL the
+JSONL commit log vouches for, so a run picks up exactly where it stopped —
+after a Ctrl-C, a kernel restart, or a fresh execution of this notebook days
+later over the same parquet. Only the pages still missing are fetched; the
+finished ones are never touched, and the final parquet is streamed back
+together from the parts either way.
+
+`prepare_run` (§1) is what makes that *safe*. The commit log is keyed by URL
+and nothing else, so it cannot tell that a **different** input is being poured
+into the same table — which would union two URL populations into one parquet
+and quietly corrupt every count downstream. So each run stamps
+`run_manifest.json` with what it drew from (the input file's path/size/mtime,
+or the synthetic corpus's size/seed) plus the knobs that decide which URLs are
+in scope (`max_urls`, `dedupe_by`, `only_recommended`, `offline`); pointing
+this notebook at a different input without clearing `OUT` raises rather than
+merges. Changing a *classification* knob never blocks — those rows are stale,
+not wrong-population, and the cure is the retroactive rescue in §8, not a
+re-scrape.
+
+> **This is the bug this notebook used to have.** The setup cell called
+> `shutil.rmtree(OUT)` immediately before the run, so `resume=True` always
+> found an empty directory and every execution re-scraped the whole corpus
+> from scratch. The wipe is now opt-in: `CONVEYER_FRESH=1`.
 """)
 
 code("""
 art = run_scrape(cfg)
 pages, products = art["pages"], art["products"]
+print(f"\\nnew this run: {art['n_new']} pages | table now: {len(pages)} pages, "
+      f"{len(products)} products")
 sorted(p.name for p in OUT.iterdir())
+""")
+
+md("""
+### 2.1 · Proving it resumes
+
+The same config, run again. Every URL is already in the commit log, so nothing
+is re-fetched, nothing is duplicated, and the table holds the same population —
+`n_new == 0`. An interrupted run behaves identically; it just still has pages
+pending, and does only those.
+""")
+
+code("""
+again = run_scrape(cfg)
+print(f"\\nsecond run -> new pages: {again['n_new']} | "
+      f"table: {len(again['pages'])} pages (was {len(pages)})")
+assert again["n_new"] == 0, "a repeat run must not redo finished URLs"
+assert len(again["pages"]) == len(pages), "a repeat run must not duplicate rows"
 """)
 
 # ---------------------------------------------------------------------------- #
 md("""
-## 3 · `fact_scraped_page` — one row per URL (61 columns)
+## 3 · `fact_scraped_page` — one row per URL (62 columns)
 
 Identity + fetch metadata (now incl. `response_headers` / `server_platform`)
 + extracted page info + classification (+ the page↔chat roll-up
@@ -602,7 +657,14 @@ md("""
 python -m conveyer.scraping --clickstream-dir data/conversations.parquet \\
     --online --max-urls 2000 --hard-timeout 30 --progress-every 50
 
-# interrupted? same command again — resumes from the JSONL
+# interrupted? the SAME command again resumes from the commit log — only the
+# URLs that never landed are fetched. Run it in a loop until n_new hits 0.
+python -m conveyer.scraping --clickstream-dir data/conversations.parquet --online --max-urls 2000
+
+# start that run over on purpose (clears the commit log + parts, keeps the
+# HTML cache and the learned model, which are derived and safe to reuse)
+python -m conveyer.scraping --clickstream-dir data/conversations.parquet --online --no-resume
+
 # self-train the model on your accumulated real rows, then re-run
 python -m conveyer.scraping.model train --pages outputs/scrape/scraped_pages.parquet
 python -m conveyer.scraping.model eval
@@ -612,9 +674,20 @@ python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet --appl
 python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet --reclassify --apply # content-aware
 ```
 
+**Resuming a long run.** The state lives in `out_dir`, not in this kernel, so
+the run survives the notebook: `resume=True` (default) skips every URL the
+JSONL commit log already vouches for, and the parquet is rebuilt from the
+parquet parts each time. Mid-run progress is directly queryable —
+`pd.read_parquet("outputs/scrape/scraped_pages_parts")` — without stopping
+anything. Guard it with `prepare_run(cfg)` so a re-run over a *different*
+input can't silently merge two populations into one table; start clean with
+`prepare_run(cfg, fresh=True)` (or `CONVEYER_FRESH=1` in this notebook,
+`--no-resume` on the CLI).
+
 | knob | default | meaning |
 |---|---|---|
 | `offline` | `True` | never touch the network |
+| `resume` / `out_dir` | `True` / `outputs/scrape` | continue from the commit log · where the run's state lives |
 | `browser_headers` | `True` | realistic Chrome profile; robots.txt still honored |
 | `timeout` / `hard_timeout` | 10s / 30s | socket timeout · wall-clock cap per URL |
 | `fetch_policy` / `max_fetch_per_domain` | `smart` / 25 | skip URL-decided pages; cap per-domain fetches |

@@ -1292,6 +1292,149 @@ def test_checkpoint_parts_bounded_memory():
         shutil.rmtree(out, ignore_errors=True)
 
 
+def test_prepare_run_continues_the_same_run():
+    """The notebook pattern: prepare_run + run_scrape, twice over one out_dir.
+    The second pass must be a no-op — this is the regression guard for the
+    notebook cell that used to rmtree(OUT) before every run, which left
+    resume=True with nothing to resume from."""
+    from conveyer.scraping.resume import manifest_path, pages_done, prepare_run
+    out = tempfile.mkdtemp(prefix="conveyer_prepare_")
+    try:
+        cfg = ScrapeConfig(synthetic_n_pages=12, out_dir=out, progress_every=0)
+
+        first = prepare_run(cfg)
+        _check(first.action == "new", f"empty out_dir starts new, got {first.action}")
+        art1 = run_scrape(cfg)
+        _check(art1["n_new"] == 12, f"first run scrapes everything, got {art1['n_new']}")
+        _check(os.path.exists(manifest_path(cfg)), "a run stamps its identity")
+
+        second = prepare_run(cfg)
+        _check(second.action == "resume" and second.pages_done == 12,
+               f"same config resumes 12 pages, got {second.action}/{second.pages_done}")
+        _check(second.resuming, "status.resuming is the one-liner for 'has work behind it'")
+        art2 = run_scrape(cfg)
+        _check(art2["n_new"] == 0, f"nothing left to do, n_new {art2['n_new']}")
+        _check(len(art2["pages"]) == len(art1["pages"]) == 12,
+               f"table unchanged by the repeat run: {len(art2['pages'])}")
+        _check(pages_done(cfg) == 12, "commit log still vouches for all 12")
+
+        # ... and starting over is opt-in, not the default
+        fresh = prepare_run(cfg, fresh=True)
+        _check(fresh.action == "fresh" and fresh.pages_done == 12,
+               f"fresh=True discards the 12 stored pages, got {fresh}")
+        _check(pages_done(cfg) == 0, "fresh=True really cleared the commit log")
+        _check(run_scrape(cfg)["n_new"] == 12, "after fresh, everything is scraped again")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_synthetic_corpus_is_reproducible_across_processes():
+    """The corpus is documented as seeded and deterministic, and resume leans on
+    it: ids built from the builtin hash() change with every interpreter (CPython
+    salts string hashing via PYTHONHASHSEED), so a resumed run would read those
+    URLs as brand-new pages and grow the table a little on every re-run."""
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    snippet = (
+        "import hashlib;"
+        "from conveyer.scraping.synthetic import make_corpus;"
+        "c = make_corpus(24, 7);"
+        "print(hashlib.sha1(('|'.join(c.urls['url']) + '||' + "
+        "''.join(sorted(c.html_by_url.values()))).encode()).hexdigest())")
+    digests = set()
+    for hash_seed in ("0", "1", "9999"):
+        env = dict(os.environ, PYTHONHASHSEED=hash_seed, PYTHONPATH=root)
+        proc = subprocess.run([sys.executable, "-c", snippet], cwd=root, env=env,
+                              capture_output=True, text=True)
+        _check(proc.returncode == 0, f"corpus subprocess failed: {proc.stderr[-400:]}")
+        digests.add(proc.stdout.strip())
+    _check(len(digests) == 1,
+           f"corpus (URLs + markup, incl. SKUs) must not vary with the hash seed: {digests}")
+
+
+def test_prepare_run_refuses_to_merge_two_inputs():
+    """Resuming is URL-keyed, so a *different* input poured into the same
+    out_dir would union two populations into one parquet. The manifest catches
+    it: raise by default, and only merge when explicitly told to."""
+    from conveyer.scraping.resume import (ResumeMismatch, manifest_input_drift,
+                                          pages_done, prepare_run)
+    out = tempfile.mkdtemp(prefix="conveyer_mismatch_")
+    try:
+        cfg_a = ScrapeConfig(synthetic_n_pages=12, out_dir=out, progress_every=0)
+        prepare_run(cfg_a)
+        run_scrape(cfg_a)
+
+        # a different corpus -> a different URL population in the same directory
+        cfg_b = ScrapeConfig(synthetic_n_pages=20, out_dir=out, progress_every=0)
+        _check(manifest_input_drift(cfg_b), "a changed corpus must show up as drift")
+        try:
+            prepare_run(cfg_b)
+            raise AssertionError("prepare_run must refuse a different input by default")
+        except ResumeMismatch as exc:
+            _check("different input" in str(exc), f"actionable message, got {exc}")
+        _check(pages_done(cfg_b) == 12, "a refusal must not delete anything")
+
+        # selection knobs count as input, not labelling
+        cfg_c = ScrapeConfig(synthetic_n_pages=12, out_dir=out, progress_every=0,
+                             only_recommended=True)
+        _check([k for k, _o, _n in manifest_input_drift(cfg_c) if k == "only_recommended"],
+               "only_recommended changes which URLs are in scope")
+
+        # ... but a labelling knob is stale-not-wrong: it warns and continues
+        cfg_d = ScrapeConfig(synthetic_n_pages=12, out_dir=out, progress_every=0,
+                             extra_relevance_terms=("beard oil",))
+        status = prepare_run(cfg_d)
+        _check(status.action == "resume", f"a vocabulary change must not block, got {status.action}")
+        _check(any(k == "extra_relevance_terms" for k, _o, _n in status.label_changes),
+               "the vocabulary change is reported")
+        _check("--reclassify" in status.message,
+               "and points at the retroactive rescue instead of a re-scrape")
+
+        # explicit opt-outs. An accepted merge is remembered: stamping the
+        # newest input on a mixed table must not make it read as one population.
+        merged = prepare_run(cfg_b, on_mismatch="resume")
+        _check(merged.action == "resume" and merged.notes, "on_mismatch='resume' merges, loudly")
+        still_mixed = prepare_run(cfg_b)
+        _check(any("spans 2 inputs" in n for n in still_mixed.notes),
+               f"a merged table keeps saying so, got {still_mixed.notes}")
+
+        cfg_e = ScrapeConfig(synthetic_n_pages=30, out_dir=out, progress_every=0)
+        wiped = prepare_run(cfg_e, on_mismatch="fresh")
+        _check(wiped.action == "fresh" and pages_done(cfg_e) == 0,
+               f"on_mismatch='fresh' starts over, got {wiped.action}")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_reset_run_state_spares_derived_artifacts():
+    """Starting over drops what the run owns, but not the caches that are
+    expensive to rebuild and safe to reuse: the HTML cache and the model."""
+    from conveyer.scraping.resume import manifest_path, reset_run_state
+    out = tempfile.mkdtemp(prefix="conveyer_reset_")
+    cache = tempfile.mkdtemp(prefix="conveyer_reset_cache_")
+    try:
+        model = os.path.join(out, "page_model.npz")
+        cfg = ScrapeConfig(synthetic_n_pages=10, out_dir=out, progress_every=0,
+                           cache_dir=cache, model_path=model)
+        run_scrape(cfg)
+        keep = os.path.join(cache, "sentinel.html")
+        with open(keep, "w") as fh:
+            fh.write("<html></html>")
+
+        n = reset_run_state(cfg)
+        _check(n == 10, f"reports what it discarded, got {n}")
+        for gone in (cfg.pages_jsonl_path(), cfg.products_jsonl_path(), cfg.pages_path(),
+                     cfg.products_path(), manifest_path(cfg)):
+            _check(not os.path.exists(gone), f"run state removed: {gone}")
+        for gone in (cfg.pages_parts_dir(), cfg.products_parts_dir()):
+            _check(not os.path.isdir(gone), f"parts removed: {gone}")
+        _check(os.path.exists(keep), "the HTML cache survives a reset")
+        _check(os.path.exists(model), "the learned model survives a reset")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+        shutil.rmtree(cache, ignore_errors=True)
+
+
 def test_offline_cache_is_lazy_and_html_path_recorded():
     """Offline mode must serve previously fetched pages from the per-URL disk
     cache (never preloading a corpus), and the page row must record where the

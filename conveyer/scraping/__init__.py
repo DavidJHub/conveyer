@@ -28,6 +28,7 @@ Building blocks: :mod:`~conveyer.scraping.sources` (URLs from the clickstream),
 
 from .config import ScrapeConfig
 from .pipeline import evaluate, run_scrape
+from .resume import prepare_run, reset_run_state
 from .taxonomy import CATEGORY_DEFINITIONS, PAGE_CATEGORIES, SELLER_TYPES
 
 
@@ -48,6 +49,8 @@ def classify_url(url: str, cfg: "ScrapeConfig | None" = None):
 __all__ = [
     "ScrapeConfig",
     "run_scrape",
+    "prepare_run",
+    "reset_run_state",
     "evaluate",
     "classify_url",
     "PAGE_CATEGORIES",

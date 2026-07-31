@@ -13,6 +13,7 @@ can be scored end-to-end (see :func:`conveyer.scraping.pipeline.evaluate`).
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Dict, List, Tuple
 
@@ -40,6 +41,20 @@ _RETAILERS = [("Amazon", "amazon.com"), ("Sephora", "sephora.com"),
               ("Ulta", "ulta.com"), ("Target", "target.com")]
 _EDITORIAL = [("Byrdie", "byrdie.com"), ("Allure", "allure.com"),
               ("Wirecutter", "nytimes.com")]
+
+
+def _stable_id(text: str, mod: int) -> int:
+    """A reproducible pseudo-id derived from ``text``.
+
+    Deliberately **not** ``hash()``: CPython salts string hashing per process
+    (PYTHONHASHSEED), so builtin-hash ids differ between interpreter runs. That
+    made this "seeded, deterministic" corpus generate different community-thread
+    URLs and SKUs on every process — which a resumed run reads as brand-new
+    URLs, growing the table on each re-run (see
+    :mod:`conveyer.scraping.resume`). md5 is stable everywhere; it is an id
+    here, never a security primitive.
+    """
+    return int.from_bytes(hashlib.md5(text.encode("utf-8")).digest()[:8], "little") % mod
 
 
 def _jsonld(obj: dict) -> str:
@@ -107,7 +122,7 @@ def _pdp(brand, domain, product, cat, price, rating, rc, retailer=None
     url = f"https://www.{host}/products/{brand.lower().replace(' ', '-')}-{slug}"
     ld = _jsonld({"@context": "https://schema.org", "@type": "Product",
                   "name": f"{brand} {product}", "brand": {"@type": "Brand", "name": brand},
-                  "category": cat, "sku": f"{brand[:3].upper()}-{abs(hash(product)) % 100000}",
+                  "category": cat, "sku": f"{brand[:3].upper()}-{_stable_id(product, 100000)}",
                   "description": f"{brand} {product} for {cat} — gentle, effective daily skincare.",
                   "aggregateRating": {"@type": "AggregateRating", "ratingValue": rating,
                                       "reviewCount": rc},
@@ -166,7 +181,7 @@ def _search(query) -> Tuple[str, str, str, str, str]:
 
 def _community(product, brand) -> Tuple[str, str, str, str, str]:
     slug = product.lower().replace(" ", "_")
-    url = f"https://www.reddit.com/r/SkincareAddiction/comments/{abs(hash(slug)) % 10**7}/review_{slug}"
+    url = f"https://www.reddit.com/r/SkincareAddiction/comments/{_stable_id(slug, 10**7)}/review_{slug}"
     ld = _jsonld({"@context": "https://schema.org", "@type": "DiscussionForumPosting",
                   "headline": f"Review: {brand} {product}"})
     body = (f"<h1>Has anyone tried {brand} {product}?</h1>"

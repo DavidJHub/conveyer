@@ -60,6 +60,8 @@ from .fetch import (Fetcher, FetchResult, _cache_path, _now, base_url_of,
                     query_stripped_url)
 from .fingerprint import detect_platform
 from .products import extract_products, match_products
+from .resume import iter_jsonl as _iter_jsonl
+from .resume import manifest_input_drift, write_manifest
 from .schema import (PAGE_SCHEMA, PRODUCT_SCHEMA, finalize_from_parts,
                      next_part_seq, page_row, part_column_values, product_rows,
                      write_part)
@@ -89,22 +91,6 @@ def _resolve_sources(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None)
 # --------------------------------------------------------------------------- #
 # Incremental persistence (JSONL commit log + parquet part files)
 # --------------------------------------------------------------------------- #
-def _iter_jsonl(path: str):
-    """Stream a JSONL file row by row, tolerating a torn final line from a
-    crash. Never materializes the whole file."""
-    if not os.path.exists(path):
-        return
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-
 def _recover_state(cfg: ScrapeConfig) -> Tuple[set, int]:
     """Reconcile the JSONL commit logs with the parquet part files, in bounded
     memory. Returns ``(done_urls, n_pages_done)``.
@@ -449,6 +435,16 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
         if done_urls:
             print(f"[resume] {n_done} pages already done in "
                   f"{cfg.pages_jsonl_path()} — skipping them")
+            # the commit log is keyed by URL alone, so it cannot tell that a
+            # different input is being poured into the same table — the manifest
+            # can. Never fatal here; conveyer.scraping.resume.prepare_run() is
+            # the gate for callers who want one.
+            drift = manifest_input_drift(cfg)
+            if drift:
+                print(f"[resume] WARNING: {', '.join(k for k, _o, _n in drift)} changed "
+                      f"since those pages were scraped — this table will hold two URL "
+                      f"populations. Gate it with resume.prepare_run(cfg), start clean "
+                      f"with --no-resume, or use a separate --out-dir.")
 
     row_by_url: Dict[str, dict] = {}
     pending: List[str] = []
@@ -550,6 +546,9 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
 
     pages_df = pd.read_parquet(cfg.pages_path())
     products_df = pd.read_parquet(cfg.products_path())
+    # stamp what this table was built from, so the next run can tell whether it
+    # is the same run continuing or a different input about to be merged in
+    write_manifest(cfg, len(pages_df))
     print(f"[export] {cfg.pages_path()} ({len(pages_df)} pages) | "
           f"{cfg.products_path()} ({len(products_df)} products) | new this run: {n_new}")
 

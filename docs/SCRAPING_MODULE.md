@@ -398,6 +398,44 @@ how many pages the run covers:
 * the **raw HTML of every fetched page is on disk**, one file per URL, in
   `outputs/scrape_cache/` — the page row's **`html_path`** column points at
   it, so any page can be re-inspected or re-classified without re-fetching.
+
+### Run identity — why resume needs a manifest
+
+The commit log is keyed by URL and nothing else, so it cannot tell that a
+**different input** is being poured into a directory that already holds a
+finished run: the URLs simply don't collide, every one of them looks new, and
+the parquet quietly ends up holding two URL populations. Every count, rate and
+ranking computed from it is then over a corpus that never existed.
+
+So each run stamps `out_dir/run_manifest.json` with what it drew from — the
+input file's path/size/mtime (or a star-schema directory's file digest, or the
+synthetic corpus's size/seed) — plus the knobs that decide *which* URLs are in
+scope: `max_urls`, `dedupe_by`, `only_recommended`, `offline`.
+`conveyer.scraping.resume.prepare_run(cfg)` compares it against the config in
+hand and returns `new` / `resume` / `adopt` / `fresh`, raising `ResumeMismatch`
+rather than merging silently (`on_mismatch="fresh"` starts over,
+`on_mismatch="resume"` merges on purpose — and the manifest then *keeps saying*
+the table spans two inputs). `run_scrape` itself stays permissive: it writes
+the manifest and prints a `[resume] WARNING:` when the input drifted.
+
+A change to a **labelling** knob (relevance vocabulary, learned model, vendor
+prior, fetch policy, match thresholds) never blocks — those rows are stale, not
+wrong-population, and the cure is the retroactive `--reclassify` rescue below,
+not a re-scrape. `prepare_run` says so when it sees one.
+
+```python
+from conveyer.scraping import ScrapeConfig, prepare_run, run_scrape
+
+cfg = ScrapeConfig(clickstream_dir="data/conversations.parquet",
+                   out_dir="outputs/scrape", offline=False)
+print(prepare_run(cfg).message)   # decides + explains; fresh=True to start over
+art = run_scrape(cfg)             # picks up exactly where the last run stopped
+```
+
+`reset_run_state(cfg)` is the programmatic "start over": it drops the commit
+logs, parts, parquets, domain profiles and manifest, but deliberately spares
+the HTML cache and the learned model — both derived, expensive to rebuild and
+safe to reuse.
   Offline replays read these files lazily, never preloading them into RAM.
 
 **What it uses.** **pyarrow** for parquet (`ParquetWriter` for the streaming
@@ -728,7 +766,8 @@ python -m conveyer.scraping
 python -m conveyer.scraping --clickstream-dir data/conversations.parquet \
     --online --max-urls 500 --hard-timeout 30
 
-# resume after Ctrl-C (default behaviour — just rerun the same command)
+# resume after Ctrl-C (default behaviour — just rerun the same command; only
+# the URLs that never landed are fetched)
 # start over instead:
 python -m conveyer.scraping ... --no-resume
 

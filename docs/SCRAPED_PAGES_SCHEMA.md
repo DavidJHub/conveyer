@@ -24,6 +24,12 @@ everything already in the sidecar. A crash or Ctrl-C loses at most the page
 in flight. Raw HTML lives one-file-per-URL in the fetch cache; each page row's
 `html_path` points at its file.
 
+`run_manifest.json` sits beside them recording what the table was built from
+(input path/size/mtime or synthetic size/seed, plus `max_urls` / `dedupe_by` /
+`only_recommended` / `offline`), so a resumed run can tell whether it is the
+same run continuing or a different input about to be merged in — see
+`conveyer.scraping.resume.prepare_run`.
+
 Regenerate with `python -m conveyer.scraping` (offline synthetic corpus) or,
 online, from the star-schema directory **or the raw input file alone**:
 

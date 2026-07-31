@@ -165,7 +165,7 @@ smoothed stage sequence) and `max_funnel_stage_idx`.
   produced *negative* exposure coefficients — visit counts are consequences of
   following a recommendation, and conditioning on them absorbed the effect
   being measured (a textbook post-treatment-bias failure we hit in practice,
-  §7.5). Association, not causation, is stated on every surface.
+  §7.6). Association, not causation, is stated on every surface.
 * **Validation**: the synthetic generator plants five session archetypes
   (converter-via-rec 25 %, browser-via-rec 25 %, organic-converter 10 %,
   no-follow 30 %, researcher 10 %) with **deterministic largest-remainder
@@ -665,7 +665,40 @@ replays whatever was cached first (which once included a 202 challenge shell
 `fetch_status`/`html_path`/the JSONL row before concluding a classifier
 regression.
 
-### 7.5 Modeling failures worth remembering
+### 7.5 The notebook that wiped its own resume state
+
+The mirror image of §7.4 — "I re-run it and it starts from the beginning."
+The pipeline's resume was never broken; notebook 02's setup cell called
+`shutil.rmtree(OUT)` immediately before `run_scrape`, so `resume=True`
+always woke up to an empty directory. A safety net for a *demo* (guarantee a
+clean run) silently became the reason a *real* run could never be continued.
+
+Fixing it surfaced a second bug hiding underneath. Once re-runs stopped
+wiping, each execution of the notebook added ~5 pages to a supposedly fixed
+60-page corpus. Cause: `synthetic.py` built community-thread URLs and SKUs
+from the builtin `hash()`, and CPython salts string hashing per process
+(`PYTHONHASHSEED`) — so a corpus documented as *seeded and deterministic*
+generated different URLs in every interpreter, which a resumed run correctly
+read as pages it had never seen. Swapped for an md5-derived id, with a test
+that regenerates the corpus under three hash seeds and compares digests.
+
+Two lessons. First, **a wipe used as a convenience is indistinguishable from
+a wipe used as a bug** — the destructive step should be the opt-in
+(`CONVEYER_FRESH=1`), never the default. Second, **wiping state masks
+non-determinism**: the corpus had been unreproducible across processes all
+along, and only a resumable run could reveal it.
+
+The fix also closed a hazard the resume never had an answer for: the commit
+log is keyed by URL and nothing else, so pointing a *different* input at a
+populated `out_dir` merges two URL populations into one parquet, and every
+count computed downstream is over a corpus that never existed. Runs now stamp
+`run_manifest.json` (input path/size/mtime or the synthetic size/seed, plus
+`max_urls` / `dedupe_by` / `only_recommended` / `offline`), and
+`resume.prepare_run(cfg)` refuses to cross one — while a change to a
+*labelling* knob only warns, because those rows are stale rather than
+wrong-population and §5.3's `--reclassify` already repairs them in place.
+
+### 7.6 Modeling failures worth remembering
 
 * **Post-treatment bias in the flesh**: the first single logistic model
   produced negative exposure coefficients because visit counts (a
@@ -749,7 +782,10 @@ python -m conveyer.pipeline --data data/conversations.parquet --online
 # module 2 alone — polite, block-resilient, resumable
 python -m conveyer.scraping --clickstream-dir data/conversations.parquet \
     --online --max-urls 2000 --hard-timeout 30 --progress-every 50
-# interrupted? run the same command again — resumes from the JSONL
+# interrupted? run the same command again — resumes from the JSONL commit log,
+# fetching only the URLs that never landed. --no-resume starts over instead.
+# Guard a scripted/notebook run so a DIFFERENT input can't merge into the same
+# table:  from conveyer.scraping import prepare_run; print(prepare_run(cfg).message)
 
 # repairs on an existing parquet (no re-scrape)
 python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet            # URL-rule report
@@ -769,11 +805,12 @@ python notebooks/_build_notebook_02.py --execute
 Working agreements learned the hard way: restart Jupyter kernels after every
 pull; treat merges as code changes (run the suites); notebooks conflict as
 whole files — pick a side and regenerate; check `fetch_status`/`html_path`
-before diagnosing a "classifier bug"; extend brands in `conveyer/brands.py`
-and domains in `data/domain_directory.json` — never inline.
+before diagnosing a "classifier bug"; make destructive steps opt-in, never a
+default (§7.5); extend brands in `conveyer/brands.py` and domains in
+`data/domain_directory.json` — never inline.
 
 Test suites (all standalone-runnable, no pytest needed):
-`tests/test_scraping.py` (45) · `tests/test_conversations.py` (7) ·
+`tests/test_scraping.py` (49) · `tests/test_conversations.py` (7) ·
 `tests/test_journey.py` (5) · `tests/test_dashboard.py` (2).
 
 ---

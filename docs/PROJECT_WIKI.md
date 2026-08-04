@@ -9,11 +9,11 @@
 
 | | |
 |---|---|
-| **Status** | v0.3 — pipeline complete, validated on synthetic ground truth; awaiting real-data run |
-| **Input** | one parquet of LLM shopping conversations (schema §4) |
-| **Outputs** | 8 parquet tables + an HTML insight dashboard (§8–§9) |
-| **Tests** | 36 across four suites, all offline (`python tests/test_*.py`) |
-| **Key docs** | [DATA_DICTIONARY](DATA_DICTIONARY.md) · [FUNNEL_MODEL](FUNNEL_MODEL.md) · [SCRAPED_PAGES_SCHEMA](SCRAPED_PAGES_SCHEMA.md) · [STATE_OF_THE_ART](STATE_OF_THE_ART.md) |
+| **Status** | v0.4 — four modules; funnel validated on synthetic ground truth, sales-attribution layer built and running on declared assumptions; awaiting real-data and market-data runs |
+| **Input** | one parquet of LLM shopping conversations (schema §4); optionally brand-week sales + media spend for module 4 |
+| **Outputs** | 16 parquet tables + an HTML insight dashboard (§8–§9) |
+| **Tests** | 92 across five suites, all offline (`python tests/test_*.py`) |
+| **Key docs** | [SALES_ATTRIBUTION](SALES_ATTRIBUTION.md) · [DATA_DICTIONARY](DATA_DICTIONARY.md) · [FUNNEL_MODEL](FUNNEL_MODEL.md) · [SCRAPED_PAGES_SCHEMA](SCRAPED_PAGES_SCHEMA.md) · [STATE_OF_THE_ART](STATE_OF_THE_ART.md) |
 
 ---
 
@@ -118,6 +118,10 @@ flowchart LR
     P --> M3
     M3 --> J[/"funnel_events · journey_features<br/>funnel_transitions · model_coefficients"/]
     J --> D["dashboard.py<br/>insight dashboard (HTML)"]
+    J --> M4["MODULE 4<br/>attribution/<br/>project · bridge to € · MMM"]
+    T --> M4
+    S[("RMS · Omnisales · CPS<br/>media spend")] --> M4
+    M4 --> A[/"fact_ai_exposure_weekly<br/>ai_influenced_sales · sensitivity<br/>mmm_coefficients"/]
 ```
 
 Support layer: `ingest.py` (loading, trail parsing, synthetic GT),
@@ -228,6 +232,41 @@ not to interpret). Rationale for the split: visit counts are *consequences*
 of following a recommendation; controlling for them absorbs the effect
 (mediator trap).
 
+### Module 4 — attribution (*how much of the sales*)
+
+Modules 1–3 measure behaviour inside a desktop panel; the business asks for a
+share of market sales. Module 4 is that span, and it is built around one rule:
+**the panel gives shares and relativities, company data gives levels.**
+
+It aggregates sessions to **week × market × category × llm_platform × brand**
+(the three new dimensions default when the extract lacks them), projects panel
+counts to the universe (`PanelFrame`, Kish weights, design effect — and it
+refuses to invent an interval when no denominator exists), then bridges to
+euros **two independent ways**: bottom-up (journeys → orders → offline
+multiplier → basket value) and top-down (AI reach among category purchase
+occasions × brand exposure × influence). Their `reconciliation_ratio` is
+reported, not smoothed.
+
+Every unobservable step is a declared :class:`Factor` in an **assumption
+ledger** — value, range, source, and a status from `measured` to
+`placeholder`. The chain is Monte-Carlo'd over those ranges and a tornado
+ranks which unknown owns the answer; on the current ledger the panel's own
+sampling error is nowhere near the top, which is what makes the data roadmap
+an output rather than an opinion.
+
+Finally the AI channel enters a **marketing-mix model**: share-of-voice
+regressor (a conversation *count* is collinear with adoption and comes back
+with the wrong sign — `compare_ai_variables()` demonstrates it), adstock and
+saturation, VIF diagnostics that say whether the coefficient may be quoted at
+all, a prior calibrated from the bridge, and a two-stage
+media → AI-visibility → sales decomposition that turns "a channel we can't
+buy" into a measurable lever. Full methodology, the 12-week plan and the open
+questions for the data partners: **[SALES_ATTRIBUTION.md](SALES_ATTRIBUTION.md)**.
+
+> **Influenced ≠ incremental.** The first is a touchpoint claim the panel can
+> support; the second is causal and rests on the MMM. Module 4 reports both,
+> always labelled.
+
 ## 7 · The funnel model in one picture
 
 ```mermaid
@@ -259,6 +298,13 @@ Eight parquet tables, every schema pinned
 | `journey_features` | session | features + exposure flags + outcome (the model table) |
 | `funnel_transitions` | stage-pair | count, row-normalised prob |
 | `model_coefficients` | feature × model | standardized coef, odds ratio per SD |
+| `fact_ai_exposure_weekly` | week × market × category × platform × brand | mentions, unsolicited, visits, conversions, share of voice, projected counts — **the artefact for the MMM team** |
+| `fact_ai_category_weekly` | week × market × category × platform | conversation volume, reach, proxy conversion rate |
+| `ai_influenced_sales` | brand-week | influenced/incremental value + share (p05–p95), both routes, reconciliation ratio, publish flag |
+| `ai_attribution_totals` | metric | the headline numbers with intervals |
+| `ai_attribution_sensitivity` | factor | the tornado: which unknown owns the answer |
+| `ai_attribution_factors` | factor | the ledger snapshot used: value, range, source, status |
+| `mmm_coefficients` / `mmm_diagnostics` | feature | contributions and shares / VIF |
 
 ## 9 · The insight dashboard
 
@@ -289,7 +335,14 @@ pip install -r requirements.txt
 python -m conveyer.pipeline                                   # offline synthetic + self-validation
 python -m conveyer.pipeline --data data/conversations.parquet --online --dashboard
 python -m conveyer.scraping --clickstream-dir data/conversations.parquet --online   # module 2 alone
-python tests/test_scraping.py  # …_conversations, _journey, _dashboard
+
+python -m conveyer.attribution                                # module 4, synthetic market
+python -m conveyer.attribution --journey-dir outputs/journey \
+    --turns outputs/conversations/turn_features.parquet \
+    --sales data/rms_brand_week.parquet --media data/media_spend.parquet
+python -m conveyer.attribution --dump-ledger data/ledger.json # edit, then pass --ledger
+
+python tests/test_scraping.py  # …_conversations, _journey, _dashboard, _attribution
 ```
 
 Notebooks (committed executed): `01_funnel_pipeline.ipynb` (the whole story),
@@ -330,10 +383,14 @@ Notebooks (committed executed): `01_funnel_pipeline.ipynb` (the whole story),
 | horizon | item |
 |---|---|
 | near | run on the real conversations parquet; calibrate the classifier on a hand-labelled URL sample |
+| near | brand ↔ RMS/Omnisales hierarchy mapping — the keystone of module 4 ([SALES_ATTRIBUTION §2](SALES_ATTRIBUTION.md)) |
+| near | calibrate `cart_to_order` against our own shop's orders; pull `basket_value` from RMS — both need no data partner |
 | near | per-brand random effects in the conversion model once volume allows |
+| mid | user-level longitudinal browsing instead of a fixed post-prompt trail (retires `window_recovery`, moves the outcome to a 7/14/30-day window) |
+| mid | AI variable inside the production MMM; incrementality replaces its placeholder |
 | mid | covariate-dependent HMM transitions (does a recommendation shift P(Discovery→Evaluation)?) |
 | mid | order-confirmation page patterns to tighten the conversion proxy |
-| far | randomised exposure (agent-side A/B or simulator) for causal identification |
+| far | content/GEO experiments (move what the assistant says, measure the sales change) for causal identification |
 
 ## 14 · Glossary
 
@@ -345,6 +402,10 @@ Notebooks (committed executed): `01_funnel_pipeline.ipynb` (the whole story),
 | **commerce depth** | 0 none · 1 shopping page · 2 cart · 3 checkout/order |
 | **conversion (proxy)** | session reached the configured depth in its trail |
 | **exposure model vs full model** | without vs with post-treatment mediators (browsing volume, dwell) |
+| **influenced vs incremental** | the AI conversation was in the journey (touchpoint, measurable) vs the sale would not have happened otherwise (causal, needs the MMM) |
+| **assumption ledger** | the declared factors the euro estimate multiplies through, each with a range, a source and a status (`measured` → `placeholder`) |
+| **share of voice (AI)** | a brand's share of all brand mentions in assistant answers for the category — the trend-free MMM regressor |
+| **ROPO multiplier** | online research → any-channel purchase; the factor that carries offline volume, and the largest single unknown |
 | **fetch_scope** | where page content came from: `page`, `base` (base-URL fallback), `none` |
 | **topic-neutral subtype** | page role that carries no topical tokens by nature (cart, checkout, SERP…) — never demoted for lacking topical words |
 
@@ -387,4 +448,5 @@ BibTeX: [references.bib](references.bib).
 | date | change | author |
 |---|---|---|
 | 2026-07-22 | v0.3 wiki created: three-module architecture, funnel model, dashboard | Claude (session) |
+| 2026-08-04 | v0.4: module 4 (sales attribution + MMM), assumption ledger, weekly fact tables, [SALES_ATTRIBUTION.md](SALES_ATTRIBUTION.md) | Claude (session) |
 | | *add yours here* | |

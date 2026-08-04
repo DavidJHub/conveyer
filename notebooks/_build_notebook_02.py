@@ -135,7 +135,14 @@ while not (ROOT / "conveyer").is_dir() and ROOT != ROOT.parent:
 sys.path.insert(0, str(ROOT))
 warnings.filterwarnings("ignore")
 
-from conveyer.scraping import ScrapeConfig, run_scrape, prepare_run, CATEGORY_DEFINITIONS
+# NB: prepare_run is imported from its own module rather than the package.
+# Both work (the package re-exports it), but a kernel that imported
+# conveyer.scraping BEFORE this feature was pulled still holds the old package
+# object in sys.modules and would raise ImportError on the package-level name —
+# while a submodule it has never seen is loaded fresh from disk. Restart the
+# kernel after a pull anyway: everything else in that session is stale too.
+from conveyer.scraping import ScrapeConfig, run_scrape, CATEGORY_DEFINITIONS
+from conveyer.scraping.resume import prepare_run
 
 DATA = ROOT / "data/conversations.parquet"
 OUT = ROOT / "outputs/scrape_demo"

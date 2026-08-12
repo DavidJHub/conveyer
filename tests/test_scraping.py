@@ -1496,6 +1496,94 @@ def test_pipeline_end_to_end():
         shutil.rmtree(out, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- #
+# Relabelling (human-in-the-loop)
+# --------------------------------------------------------------------------- #
+def _relabel_fixture(out):
+    art = run_scrape(ScrapeConfig(synthetic_n_pages=24, out_dir=out, progress_every=0))
+    return art["pages"]
+
+
+def test_relabel_export_apply_and_provenance():
+    from conveyer.scraping.relabel import (apply_corrections, export_review,
+                                           is_human_labelled)
+    out = tempfile.mkdtemp(prefix="conveyer_relabel_")
+    try:
+        pages = _relabel_fixture(out)
+        csv_path = os.path.join(out, "review.csv")
+        rev = export_review(pages, csv_path, n=5,
+                            cfg=ScrapeConfig(model_path=os.path.join(out, "page_model.npz")))
+        _check(os.path.exists(csv_path), "review CSV written")
+        _check("correct_subtype" in rev.columns, "correction columns present")
+
+        corr = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        corr.loc[0, "correct_subtype"] = "article"
+        corr.loc[1, "correct_subtype"] = "no_such_subtype"
+        fixed, report = apply_corrections(pages, corr)
+        by_url = report.set_index("url")
+        _check(bool(by_url.loc[corr.loc[0, "url"], "applied"]), "valid correction applied")
+        _check(not bool(by_url.loc[corr.loc[1, "url"], "applied"]),
+               "invalid subtype rejected")
+
+        i = fixed.index[fixed["url"] == corr.loc[0, "url"]][0]
+        _check(fixed.at[i, "page_category"] == "editorial",
+               "category derived from the subtype")
+        _check(fixed.at[i, "funnel_stage"] == "Evaluation",
+               "funnel stage re-derived, not trusted")
+        _check(fixed.at[i, "classifier_method"] == "human", "method stamped")
+        _check(is_human_labelled(fixed.loc[i].to_dict()), "human signal present")
+        _check(float(fixed.at[i, "page_category_confidence"]) == 1.0,
+               "gold labels are certain")
+
+        # a stale CSV must not overwrite a newer human label
+        _, rep2 = apply_corrections(fixed, corr)
+        _check(not bool(rep2.set_index("url").loc[corr.loc[0, "url"], "applied"]),
+               "re-apply of a stale CSV is refused")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
+def test_relabel_rows_survive_repair_passes_and_boost_training():
+    from conveyer.scraping.model import build_training_samples
+    from conveyer.scraping.relabel import HUMAN_BOOST, apply_corrections
+    from conveyer.scraping.validate import (apply_validation, reclassify_pages,
+                                            write_pages)
+    out = tempfile.mkdtemp(prefix="conveyer_relabel2_")
+    try:
+        pages = _relabel_fixture(out)
+        # force a correction that the URL rules would disagree with: a cart
+        # URL relabelled as an article must stay an article
+        cart = pages[pages["page_subtype"] == "cart"]
+        _check(len(cart) > 0, "fixture has a cart row")
+        url = str(cart.iloc[0]["url"])
+        corr = pd.DataFrame([{"url": url, "correct_subtype": "article"}])
+        fixed, report = apply_corrections(pages, corr)
+        _check(bool(report.iloc[0]["applied"]), "correction applied")
+
+        cfg = ScrapeConfig(cache_dir=os.path.join(out, "cache"))
+        i = fixed.index[fixed["url"] == url][0]
+        v_fixed, _ = apply_validation(fixed, cfg)
+        _check(v_fixed.at[i, "page_subtype"] == "article",
+               "apply_validation must not overwrite a human label")
+        r_fixed, _ = reclassify_pages(fixed, cfg)
+        _check(r_fixed.at[i, "page_subtype"] == "article",
+               "reclassify_pages must not overwrite a human label")
+
+        # training treats the human row as gold and boosts it
+        path = os.path.join(out, "corrected.parquet")
+        write_pages(fixed, path)
+        _, y_with = build_training_samples(pages_parquet=path, n_synthetic=10, seed=3)
+        write_pages(pages, path)
+        _, y_without = build_training_samples(pages_parquet=path, n_synthetic=10, seed=3)
+        # the corrected row leaves its old class and enters 'article' boosted;
+        # net sample delta = HUMAN_BOOST − 1
+        _check(len(y_with) - len(y_without) == HUMAN_BOOST - 1,
+               f"human boost ×{HUMAN_BOOST} in training samples "
+               f"({len(y_with)} vs {len(y_without)})")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

@@ -342,6 +342,11 @@ python -m conveyer.attribution --journey-dir outputs/journey \
     --sales data/rms_brand_week.parquet --media data/media_spend.parquet
 python -m conveyer.attribution --dump-ledger data/ledger.json # edit, then pass --ledger
 
+# retag misclassified pages and retrain the learned channel (module 2)
+python -m conveyer.scraping.relabel export outputs/scrape/scraped_pages.parquet --out review.csv
+python -m conveyer.scraping.relabel apply  outputs/scrape/scraped_pages.parquet --corrections review.csv --apply
+python -m conveyer.scraping.relabel retrain outputs/scrape/scraped_pages.parquet
+
 python tests/test_scraping.py  # …_conversations, _journey, _dashboard, _attribution
 ```
 

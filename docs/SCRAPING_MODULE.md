@@ -777,7 +777,26 @@ print(classify_url('https://www.amazon.com/gp/cart/view.html'))"
 
 # double-check existing labels against the URL rules; --apply repairs them
 python -m conveyer.scraping.validate outputs/scrape/scraped_pages.parquet
+
+# human-in-the-loop retagging: export suspects, correct, apply, retrain
+python -m conveyer.scraping.relabel export  outputs/scrape/scraped_pages.parquet --out review.csv
+#   → fill correct_subtype on the wrong rows (category/funnel derive on apply)
+python -m conveyer.scraping.relabel apply   outputs/scrape/scraped_pages.parquet \
+    --corrections review.csv --apply
+python -m conveyer.scraping.relabel retrain outputs/scrape/scraped_pages.parquet
 ```
+
+The relabel loop is the answer to "the classifier got this page wrong":
+`export` ranks rows by independent red flags (unknowns, low confidence, thin
+evidence, URL-only coverage, learned-model disagreement); `apply` validates
+each correction against the taxonomy or rejects it loudly, then stamps the
+row `classifier_method=human` + a `human` signal at confidence 1.0 — after
+which the automated repair passes (`--apply`, `--reclassify`) leave it alone
+and a stale review CSV cannot overwrite a newer correction; `retrain` feeds
+the corrected rows to the learned channel as **gold labels, boosted ×3**, so
+a handful of fixes can overturn the pattern that taught the original mistake
+(self-training alone can never do that — the wrong label is what it trains
+on).
 
 Flags that matter while troubleshooting: `--max-urls` (small test batches),
 `--dedupe-by domain` (one page per site — fast coverage check),

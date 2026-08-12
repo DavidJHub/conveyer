@@ -1584,6 +1584,41 @@ def test_relabel_rows_survive_repair_passes_and_boost_training():
         shutil.rmtree(out, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- #
+# Readout (the classifier's one-page HTML view)
+# --------------------------------------------------------------------------- #
+def test_readout_renders_from_saved_run_and_tracks_corrections():
+    from conveyer.scraping.readout import build_readout, readout_from_dir
+    from conveyer.scraping.relabel import apply_corrections
+    out = tempfile.mkdtemp(prefix="conveyer_readout_")
+    try:
+        run_scrape(ScrapeConfig(synthetic_n_pages=20, out_dir=out,
+                                model_path=os.path.join(out, "page_model.npz"),
+                                progress_every=0))
+        html = readout_from_dir(out, os.path.join(out, "readout.html"))
+        _check(os.path.exists(os.path.join(out, "readout.html")), "html written")
+        for marker in ("Page categories", "fallback chain", "review queue",
+                       "Demo corpus", "prefers-color-scheme"):
+            _check(marker.lower() in html.lower(), f"page carries '{marker}'")
+        _check(readout_from_dir(out) == html, "pure function: same data, same page")
+
+        # a correction must change the rendered page
+        pages = pd.read_parquet(os.path.join(out, "scraped_pages.parquet"))
+        url = str(pages.iloc[0]["url"])
+        corrected, report = apply_corrections(
+            pages, pd.DataFrame([{"url": url, "correct_subtype": "article"}]))
+        _check(bool(report.iloc[0]["applied"]), "correction applied")
+        html2 = build_readout(corrected,
+                              cfg=ScrapeConfig(model_path=os.path.join(
+                                  out, "page_model.npz")))
+        _check(html2 != html, "the page must follow the data")
+
+        # products are optional — a pages-only render must not crash
+        _check(len(build_readout(pages)) > 1000, "renders without products")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

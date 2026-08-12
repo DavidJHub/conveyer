@@ -83,10 +83,13 @@ def validation_report(pages: pd.DataFrame,
     rows = []
     if pages is None or pages.empty or "url" not in pages.columns:
         return pd.DataFrame(columns=_REPORT_COLUMNS)
+    from .relabel import is_human_labelled
     for _, r in pages.iterrows():
         url = str(r.get("url") or "")
         if not url:
             continue
+        if is_human_labelled(r.to_dict()):
+            continue        # a human correction outranks the URL rules
         v = _classify_url_only(url, cfg)
         stored_cat = str(r.get("page_category") or "")
         stored_sub = str(r.get("page_subtype") or "")
@@ -244,12 +247,15 @@ def reclassify_pages(pages: pd.DataFrame,
     report_rows = []
     if pages is None or pages.empty or "url" not in pages.columns:
         return pages, pd.DataFrame(columns=_RECLASSIFY_COLUMNS)
+    from .relabel import is_human_labelled
     fixed = pages.copy()
     for idx in fixed.index:
         row = fixed.loc[idx].to_dict()
         stored_cat = str(row.get("page_category") or "")
         if stored_cat not in ("unrelated", "unknown"):
             continue
+        if is_human_labelled(row):
+            continue        # a human said unrelated/unknown — believe them
         url = str(row.get("url") or "")
         if not url:
             continue

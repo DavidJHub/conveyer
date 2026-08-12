@@ -352,7 +352,9 @@ python tests/test_scraping.py  # …_conversations, _journey, _dashboard, _attri
 
 Notebooks (committed executed): `01_funnel_pipeline.ipynb` (the whole story),
 `02_page_classifier.ipynb` (module 2 deep dive), `03_relabel_workflow.ipynb`
-(human retagging + retraining, guarantees asserted live). Regenerate with
+(human retagging + retraining, guarantees asserted live),
+`04_classifier_readout.ipynb` (the one-page classifier readout re-rendered
+from saved parquets). Regenerate with
 `python notebooks/_build_notebook_0*.py --execute`.
 
 ## 11 · Quality & validation

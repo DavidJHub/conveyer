@@ -784,6 +784,10 @@ python -m conveyer.scraping.relabel export  outputs/scrape/scraped_pages.parquet
 python -m conveyer.scraping.relabel apply   outputs/scrape/scraped_pages.parquet \
     --corrections review.csv --apply
 python -m conveyer.scraping.relabel retrain outputs/scrape/scraped_pages.parquet
+
+# the one-page classifier readout from any saved run (self-contained HTML:
+# taxonomy mix, evidence channels, fallback chain, products, review queue)
+python -m conveyer.scraping.readout outputs/scrape --out readout.html
 ```
 
 The relabel loop is the answer to "the classifier got this page wrong":

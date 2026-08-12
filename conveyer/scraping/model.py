@@ -337,26 +337,36 @@ def build_training_samples(pages_parquet: Optional[str] = None,
     if pages_parquet and os.path.exists(pages_parquet):
         import pandas as pd
 
+        from .relabel import HUMAN_BOOST, is_human_labelled
         from .validate import _content_for_row
         pages = pd.read_parquet(pages_parquet)
         cfg = ScrapeConfig()
-        n_weak = 0
+        n_weak = n_gold = 0
         for _, r in pages.iterrows():
             row = r.to_dict()
             sub = str(row.get("page_subtype") or "")
             conf = float(row.get("page_category_confidence") or 0.0)
-            if sub in ("", "other") or conf < min_confidence:
+            gold = is_human_labelled(row)
+            if sub in ("", "other") or (conf < min_confidence and not gold):
                 continue
             if str(row.get("page_category")) == "unknown":
                 continue
             pc, scope, _src = _content_for_row(row, cfg)
             page = pc if scope in ("page", "stripped") else None
-            X.append(featurize(str(row.get("url") or ""), page,
-                               str(row.get("prior_page_type") or ""),
-                               str(row.get("server_platform") or "")))
-            y.append(sub)
-            n_weak += 1
-        print(f"[model] +{n_weak} weak-labelled rows from {pages_parquet}")
+            feats = featurize(str(row.get("url") or ""), page,
+                              str(row.get("prior_page_type") or ""),
+                              str(row.get("server_platform") or ""))
+            # a human correction is gold: repeat it so a handful of fixed rows
+            # can out-vote the weak labels that taught the original mistake
+            repeats = HUMAN_BOOST if gold else 1
+            for _ in range(repeats):
+                X.append(feats)
+                y.append(sub)
+            n_weak += 0 if gold else 1
+            n_gold += 1 if gold else 0
+        print(f"[model] +{n_weak} weak-labelled rows"
+              + (f" +{n_gold} human-labelled rows (×{HUMAN_BOOST})" if n_gold else "")
+              + f" from {pages_parquet}")
     return X, y
 
 

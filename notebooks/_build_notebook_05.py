@@ -166,23 +166,28 @@ for sid, g in turns.sort_values(["session_id", "session_pos"]).groupby("session_
         base = {"session_id": sid, "user_id": t.get("user_id", ""),
                 "message_id": t["message_id"], "session_pos": int(t["session_pos"]),
                 "conv_stage_kw": t["conv_stage_kw"], "conv_stage_hmm": t["conv_stage_hmm"]}
+        # cited/ai_click links carry no timestamp in the schema — they happen
+        # "at" the answer, so they inherit the turn's prompt time; only the
+        # trail has real per-request epochs (next_10_urls.request_time)
+        turn_ms = (None if pd.isna(t.get("prompt_dt"))
+                   else int(t["prompt_dt"].value // 10**6))
         ledger_rows.append({**base, "seq": (seq := seq + 1), "kind": "turn",
-                            "event_type": "turn", "url": "",
+                            "event_type": "turn", "url": "", "t_ms": turn_ms,
                             "position": None, "dwell_seconds": None,
                             "question": str(t["question"])[:180]})
         clicked = set(link_urls(t.get("ai_click")))
         for url in link_urls(t.get("a_links_source")):
             ledger_rows.append({**base, "seq": (seq := seq + 1), "kind": "event",
-                                "event_type": "cited", "url": url,
+                                "event_type": "cited", "url": url, "t_ms": turn_ms,
                                 "position": None, "dwell_seconds": None, "question": ""})
         for url in clicked:
             ledger_rows.append({**base, "seq": (seq := seq + 1), "kind": "event",
-                                "event_type": "ai_click", "url": url,
+                                "event_type": "ai_click", "url": url, "t_ms": turn_ms,
                                 "position": None, "dwell_seconds": None, "question": ""})
         for ev in trail_events(t.get("next_10_urls")):
             ledger_rows.append({**base, "seq": (seq := seq + 1), "kind": "event",
                                 "event_type": "trail_visit", "url": ev["url"],
-                                "position": ev["position"],
+                                "t_ms": ev["t_ms"], "position": ev["position"],
                                 "dwell_seconds": ev["dwell_seconds"], "question": ""})
 
 ledger = pd.DataFrame(ledger_rows)
@@ -528,6 +533,18 @@ The single visual the lab exists for. Reading guide:
   at the bottom in gray). The thin gray road connects turns and events in
   journey order, so the line literally descends as the session moves toward
   purchase;
+* **the x axis is journey order, not clock time** (`X_SCALE="sequence"`,
+  the default): each band's nodes are evenly spaced and every conversation
+  is normalized to the full road width. Real epochs exist only for *turns*
+  (`prompt_datetime`) and *trail visits* (`next_10_urls.request_time`) —
+  cited links and ai-clicks carry no timestamp in the schema, so they
+  inherit their turn's prompt time. A **linear** epoch axis is therefore
+  near-useless (minutes-to-hours between turns vs seconds between trail
+  hops piles every node onto its turn); `X_SCALE="time"` instead positions
+  nodes by **log-compressed elapsed time** within the session, with a 12px
+  legibility floor for simultaneous events. In both modes the known clock
+  times are printed as small labels under the stamped nodes
+  (`SHOW_TIME_LABELS`) and in full on every tooltip;
 * **node shape = what happened** — ◆ a conversation turn (on its HMM stage
   lane) · ▪ a link the agent cited · ▲ a click straight from the answer ·
   ● a browsing-trail visit. Node color repeats the lane's stage (the lane
@@ -542,10 +559,16 @@ The single visual the lab exists for. Reading guide:
 * **hover any node** for the full audit record: URL, event, category ·
   subtype · seller, stage stored/expected, confidence, method, evidence
   signals, fetch status/scope, relevance, products found and the chat-match
-  tier, dwell.
+  tier, dwell, timestamp;
+* **click a URL node** to open that page in a new tab; **click a turn ◆**
+  to read the whole conversation — the full question/answer transcript of
+  the session opens in an overlay with the clicked turn highlighted (close
+  with ✕ or the backdrop).
 
-The page is self-contained HTML (inline SVG, no JS, light/dark aware), also
-written to `outputs/audit_lab/journey_roadmap.html` for sharing.
+The page stays self-contained HTML (inline SVG, light/dark aware, still no
+JS — links are plain SVG anchors and the transcript overlay is the CSS
+`:target` pattern), also written to `outputs/audit_lab/journey_roadmap.html`
+for sharing.
 """)
 
 code("""
@@ -555,11 +578,41 @@ FLAG = "#e34948"                                       # status: serious
 NODE_R, LANE_H, BAND_PAD, INFO_W, LBL_W, ROAD_W = 5, 17, 26, 216, 86, 1050
 BAND_H = LANE_H * len(STAGE_ORDER) + BAND_PAD
 MAX_SESSIONS = None            # cap for huge corpora; None = every conversation
+X_SCALE = "sequence"           # "sequence" (journey order) | "time" (log-elapsed)
+SHOW_TIME_LABELS = True        # clock under turns, +elapsed under trail visits
 
 _esc = lambda s: _html.escape(str(s), quote=True)
 lane_y = {s: i * LANE_H + LANE_H / 2 for i, s in enumerate(STAGE_ORDER)}
 gt_by_sid = ({str(r.session_id): str(r.gt_archetype)
               for r in ground_truth.itertuples()} if ground_truth is not None else {})
+
+def _clock(ms, fmt="%H:%M"):
+    return pd.Timestamp(int(ms), unit="ms").strftime(fmt)
+
+def _elapsed(ms):
+    s = ms / 1000.0
+    return (f"{s:.0f}s" if s < 90 else
+            f"{s / 60:.0f}m" if s < 5400 else f"{s / 3600:.1f}h")
+
+# Node x-fractions for one band. "sequence" = even journey-order spacing.
+# "time" = log-compressed elapsed epoch time (linear time is degenerate:
+# minutes between turns vs seconds between trail hops), with a 12px floor so
+# simultaneous events — cited links share their turn's prompt time — stay
+# individually clickable. Falls back to sequence when a timestamp is missing.
+def _xfracs(band):
+    n = len(band)
+    if n == 1:
+        return [0.5]
+    seq = [k / (n - 1) for k in range(n)]
+    ts = band.t_ms.to_numpy(dtype="float64")
+    if X_SCALE != "time" or np.isnan(ts).any() or ts.max() == ts.min():
+        return seq
+    f = np.log1p(ts - ts.min())
+    f = f / f.max()
+    gap = 12.0 / (ROAD_W - 32)
+    for i in range(1, n):
+        f[i] = max(f[i], f[i - 1] + gap)
+    return (f / f[-1]).tolist()
 
 def _node_tip(r):
     lines = [f"{r.event_type.upper()} · {r.url}",
@@ -578,10 +631,16 @@ def _node_tip(r):
                      + (" · COINCIDES" if r.any_coincides else ""))
     if r.prior_page_type:
         lines.append(f"vendor prior: {r.prior_page_type}")
+    if pd.notna(r.t_ms):
+        when = _clock(r.t_ms, "%Y-%m-%d %H:%M:%S")
+        lines.append(f"at {when}" if r.event_type == "trail_visit"
+                     else f"at {when} (the turn's prompt time — "
+                          f"cited/click events carry no own timestamp)")
     if r.dwell_seconds is not None and not pd.isna(r.dwell_seconds):
         lines.append(f"dwell {r.dwell_seconds:.0f}s · trail position {int(r.position)}")
     if r.flag_url_rules:
         lines.append("⚠ URL-rule double-check disagrees (see §5)")
+    lines.append("⤷ click to open the page")
     return "&#10;".join(_esc(x) for x in lines)
 
 def _shape(kind, x, y, fill, stroke, extra=""):
@@ -637,17 +696,28 @@ for si, sid in enumerate(sessions):
         svg.append(f'<text x="{INFO_W + LBL_W - 6}" y="{yy}" class="lanelbl" '
                    f'text-anchor="end" dominant-baseline="central">{stage}</text>')
     n = len(band)
-    xs = (ROAD_W - 32) / max(n - 1, 1)
+    fr = _xfracs(band)
+    t0 = band.t_ms.min() if band.t_ms.notna().any() else None
     pts, marks = [], []
+    last_lbl_x = -1e9                  # skip time labels that would collide
     for k, (_, r) in enumerate(band.iterrows()):
-        x = INFO_W + LBL_W + 16 + (k * xs if n > 1 else (ROAD_W - 32) / 2)
+        x = INFO_W + LBL_W + 16 + fr[k] * (ROAD_W - 32)
         if r.kind == "turn":
             y = y0 + BAND_PAD / 2 + lane_y[r.conv_stage_hmm]
             tip = (f"TURN {r.session_pos} · {_esc(r.question)}&#10;"
-                   f"keyword stage {r.conv_stage_kw} · HMM stage {r.conv_stage_hmm}")
-            marks.append(f'<g class="nd"><title>{tip}</title>'
-                         + _shape("turn", x, y, f'var(--st-{STAGE_INDEXES[r.conv_stage_hmm]})',
-                                  "var(--ink2)") + "</g>")
+                   f"keyword stage {r.conv_stage_kw} · HMM stage {r.conv_stage_hmm}"
+                   + (f"&#10;asked at {_clock(r.t_ms, '%Y-%m-%d %H:%M:%S')}"
+                      if pd.notna(r.t_ms) else "")
+                   + "&#10;⤷ click for the full conversation")
+            node = _shape("turn", x, y,
+                          f'var(--st-{STAGE_INDEXES[r.conv_stage_hmm]})',
+                          "var(--ink2)")
+            marks.append(f'<a href="#t-{si}-{int(r.session_pos)}">'
+                         f'<g class="nd"><title>{tip}</title>{node}</g></a>')
+            if SHOW_TIME_LABELS and pd.notna(r.t_ms) and x - last_lbl_x >= 26:
+                marks.append(f'<text x="{x}" y="{y + 15}" class="tlbl" '
+                             f'text-anchor="middle">{_clock(r.t_ms)}</text>')
+                last_lbl_x = x
         else:
             a = audit_key.loc[(sid, r.seq)]
             y = y0 + BAND_PAD / 2 + lane_y[a.funnel_stage]
@@ -667,8 +737,15 @@ for si, sid in enumerate(sessions):
                              f'stroke-dasharray="3,2.5"/>'
                              f'<line x1="{x - 4}" y1="{ey}" x2="{x + 4}" y2="{ey}" '
                              f'stroke="var(--flag)" stroke-width="2"/>')
-            marks.append(f'<g class="nd"><title>{_node_tip(a)}</title>{ring}'
-                         + _shape(a.event_type, x, y, fill, color) + "</g>")
+            node = (f'<g class="nd"><title>{_node_tip(a)}</title>{ring}'
+                    + _shape(a.event_type, x, y, fill, color) + "</g>")
+            marks.append(f'<a href="{_esc(a.url)}" target="_blank" '
+                         f'rel="noopener">{node}</a>')
+            if (SHOW_TIME_LABELS and pd.notna(r.t_ms) and t0 is not None
+                    and r.event_type == "trail_visit" and x - last_lbl_x >= 26):
+                marks.append(f'<text x="{x}" y="{y + 15}" class="tlbl" '
+                             f'text-anchor="middle">+{_elapsed(r.t_ms - t0)}</text>')
+                last_lbl_x = x
         pts.append(f"{x},{y}")
     svg.append(f'<polyline points="{" ".join(pts)}" class="road"/>')
     svg += marks
@@ -699,6 +776,35 @@ legend_shapes = ('<span class="chip">◆ turn</span><span class="chip">▪ cited
 legend_flags = ('<span class="chip flagtx">⭘ red ring = stage ≠ taxonomy</span>'
                 '<span class="chip flagtx">⌇ dashed = URL-rule disagrees</span>'
                 '<span class="chip flagtx">┬ tick = the lane it belongs to</span>')
+legend_click = ('<span class="chip">click a URL node → opens the page</span>'
+                '<span class="chip">click a turn ◆ → the full conversation</span>'
+                + ('<span class="chip">x = journey order, times on labels/tooltips'
+                   '</span>' if X_SCALE == "sequence" else
+                   '<span class="chip">x = log-elapsed session time</span>'))
+
+# the transcript overlays: one per rendered conversation, opened by clicking
+# any of its turn diamonds (CSS :target — no JS; the clicked turn highlights)
+_tblocks = []
+for _si, _sid in enumerate(sessions):
+    g = turns[turns.session_id == _sid].sort_values("session_pos")
+    blocks = []
+    for _, t in g.iterrows():
+        when = ("" if pd.isna(t.get("prompt_dt"))
+                else f" · {t['prompt_dt'].strftime('%Y-%m-%d %H:%M:%S')}")
+        blocks.append(
+            f'<div class="tb" id="t-{_si}-{int(t.session_pos)}">'
+            f'<div class="tbh">turn {int(t.session_pos)} · stage '
+            f'{_esc(t.conv_stage_kw)} (HMM {_esc(t.conv_stage_hmm)}){when}</div>'
+            f'<p class="q">{_esc(t.question)}</p>'
+            f'<p class="a">{_esc(t.answer)}</p></div>')
+    _tblocks.append(
+        f'<div class="modal" id="conv-{_si}">'
+        f'<a class="mback" href="#_" aria-label="close"></a>'
+        f'<div class="mcard"><div class="mhead"><b>{_esc(_sid)}</b>'
+        f'&nbsp;· {_esc(g.user_id.iloc[0])} · {len(g)} turns'
+        f'<a class="mclose" href="#_">close ✕</a></div>'
+        f'{"".join(blocks)}</div></div>')
+modals_html = "".join(_tblocks)
 
 src = conversations.attrs.get("source", str(INPUT))
 prov_txt = f" · {_esc(provenance)}" if provenance else ""
@@ -731,6 +837,26 @@ h1 {{ font-size:19px; margin:0 0 4px }}
 .sid {{ font-size:12.5px; font-weight:600; fill:var(--ink) }}
 .meta {{ font-size:10.5px; fill:var(--ink2) }}
 .nd:hover path, .nd:hover circle, .nd:hover rect {{ stroke-width:2.4 }}
+svg a {{ cursor:pointer }}
+.tlbl {{ font-size:7px; fill:var(--muted) }}
+.modal {{ display:none; position:fixed; inset:0; z-index:20 }}
+.modal:target, .modal:has(:target) {{ display:block }}
+.mback {{ position:absolute; inset:0; background:rgba(0,0,0,.45) }}
+.mcard {{ position:relative; margin:6vh auto; max-width:780px; max-height:82vh;
+  overflow:auto; background:var(--surface); border:1px solid var(--grid);
+  border-radius:12px; padding:16px 20px }}
+.mhead {{ display:flex; align-items:center; gap:4px; color:var(--ink2);
+  font-size:12px; margin-bottom:10px }}
+.mclose {{ margin-left:auto; color:var(--ink2); text-decoration:none;
+  background:var(--chip); border-radius:999px; padding:3px 11px; font-size:11px }}
+.tb {{ padding:9px 12px; border-radius:8px; margin-bottom:6px;
+  scroll-margin-top:12px }}
+.tb:target {{ background:var(--chip); box-shadow:inset 3px 0 0 var(--st-0) }}
+.tbh {{ font-size:10.5px; color:var(--muted); margin-bottom:4px }}
+.q {{ margin:0 0 6px; font-weight:600 }}
+.q::before {{ content:"user · "; color:var(--muted); font-weight:400 }}
+.a {{ margin:0; color:var(--ink2); white-space:pre-wrap }}
+.a::before {{ content:"agent · "; color:var(--muted) }}
 </style>
 <div class="wrap">
 <h1>Journey roadmap — the conversations vs <code>fact_scraped_page</code></h1>
@@ -740,7 +866,9 @@ coverage {(audit.page_coverage == "pages").mean():.0%} scraped ·
 <div class="legend">{legend_stages}</div>
 <div class="legend">{legend_shapes}</div>
 <div class="legend">{legend_flags}</div>
+<div class="legend">{legend_click}</div>
 <div class="card">{"".join(svg)}</div>
+{modals_html}
 </div>'''
 
 out_path = LAB_DIR / "journey_roadmap.html"

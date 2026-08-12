@@ -1,7 +1,9 @@
 # Data dictionary — input & every output table
 
-One input, seven outputs. All outputs are parquet with **pinned pyarrow
-schemas**; regenerate everything with `python -m conveyer.pipeline`.
+One conversation input (plus optional market data for module 4), sixteen
+outputs. All outputs are parquet with **pinned pyarrow schemas**; regenerate
+the funnel with `python -m conveyer.pipeline` and the attribution layer with
+`python -m conveyer.attribution`.
 
 ```mermaid
 flowchart LR
@@ -117,6 +119,62 @@ identification caveats).
 
 ---
 
+## 4 · Module 4 outputs — `outputs/attribution/`
+
+Methodology, the assumption ledger and the open data questions:
+**[SALES_ATTRIBUTION.md](SALES_ATTRIBUTION.md)**.
+
+### Extra inputs (optional; synthetic when absent)
+
+| table | grain | columns |
+|---|---|---|
+| sales | brand-week | `week` · `market` · `category` · `brand` · `sales_value` · *(optional)* `price_index`, `category_sales_value`, `category_occasions` |
+| media | brand-week | `week` · `market` · `brand` · any columns ending in `_spend` |
+
+### `fact_ai_exposure_weekly.parquet` (grain = week × market × category × llm_platform × brand)
+
+| group | columns |
+|---|---|
+| dimensions | `week` (session's **first** prompt week, Monday-anchored) · `market` · `category` · `llm_platform` |
+| counts | `n_sessions_category` · `n_sessions_mentioned` · `n_sessions_mentioned_visited` · `n_sessions_unsolicited` · `n_sessions_cited` · `n_sessions_visited` · `n_sessions_followed` · `n_sessions_converted` |
+| rates | `ai_share_of_voice` (sums to 1 within a cell) · `exposure_rate` · `visit_rate_given_exposure` |
+| projected | `*_projected` (+ `_lo`/`_hi` where a denominator exists) — present **only** when a `PanelFrame` was supplied |
+
+`n_sessions_converted` attributes each session's conversion to **one** brand
+(the deepest-commerce page it reached), so brand conversions can never sum
+above the session count.
+
+### `fact_ai_category_weekly.parquet` (grain = week × market × category × llm_platform)
+
+`n_sessions` · `n_users` · `n_sessions_followed` · `n_sessions_converted` ·
+`conversion_rate_proxy` · `n_sessions_projected` · `n_users_projected`. The
+share-of-voice denominator and the top-down route's reach anchor.
+
+### `ai_influenced_sales.parquet` (grain = brand-week)
+
+Dimensions + `sales_value` · the panel counts it used · and, for each of
+`influenced_value`, `influenced_share`, `incremental_value`, `topdown_share`,
+the `p05` / `p50` / `p95` of the Monte-Carlo distribution · plus
+`reconciliation_ratio` (bottom-up ÷ top-down) and `share_exceeds_sales` —
+**rows flagged true must not be published**; they mean the factor chain is
+inconsistent for that cell.
+
+### `ai_attribution_totals.parquet` · `ai_attribution_sensitivity.parquet` · `ai_attribution_factors.parquet`
+
+`metric` · `unit` · `p05` · `p50` · `p95` — the headline numbers ·
+`factor` · `status` · `low_x` · `high_x` · `interval_width_x` ·
+`variance_share` — the tornado, "this assumption owns X% of the uncertainty" ·
+`name` · `value` · `low` · `high` · `unit` · `status` · `source` · `note` —
+the ledger snapshot the run used.
+
+### `mmm_coefficients.parquet` · `mmm_diagnostics.parquet`
+
+`feature` · `coef` · `contribution` · `contribution_share` ·
+`feature` · `vif` · `flag`. A VIF above ~10 on the AI variable means the
+coefficient is not separable from the rest of the mix and must not be quoted.
+
+---
+
 ## Gotchas checklist
 
 1. `next_10_urls` arrives as **numpy arrays of dicts** from parquet — always
@@ -129,3 +187,9 @@ identification caveats).
    extend it before analysing a niche brand, or its mentions/pages won't link.
 5. Exposure strata are observational — `followed_recommendation` users
    self-select (see FUNNEL_MODEL.md §limitations).
+6. Module 4's euro figures are **not measurements** while the ledger still
+   holds `placeholder` factors; every run prints which ones. `influenced` is a
+   touchpoint claim, `incremental` a causal one — never quote one as the other.
+7. The bridge joins the panel's brand lexicon to the sales hierarchy on a
+   plain string key and **fails loudly** when nothing matches. That is the
+   missing mapping table, not a bug to work around.

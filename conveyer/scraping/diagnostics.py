@@ -57,17 +57,60 @@ METHOD_NOTES: Dict[str, str] = {
     "rule (url-only)": "URL + domain knowledge only — nothing was fetched",
     "llm": "low-confidence page refined by the Anthropic model",
     "human": "relabel correction — confidence pinned to 1.0, immutable",
+    "error": "row processing raised — the label fell back to unknown",
 }
+
+#: repair-pass suffixes the validate/reclassify passes append to the method
+_METHOD_SUFFIXES: Dict[str, str] = {
+    "url_validated": "URL-validated by the repair pass",
+    "reclassified": "reclassified by the repair pass",
+}
+
+
+def _method_note(m) -> str:
+    """Human meaning of a ``classifier_method`` value, including the
+    ``+url_validated`` / ``+reclassified`` suffixed variants the repair
+    passes write (``rule+prior+reclassified`` → base note + suffix note)."""
+    m = _text(m)
+    if m in METHOD_NOTES:
+        return METHOD_NOTES[m]
+    parts = [p for p in m.split("+") if p]
+    base = "+".join(p for p in parts if p not in _METHOD_SUFFIXES)
+    notes = [METHOD_NOTES.get(base, "")] + \
+        [_METHOD_SUFFIXES[p] for p in parts if p in _METHOD_SUFFIXES]
+    return "; ".join(n for n in notes if n)
+
 
 # category display order: taxonomy order, so runs are comparable page-to-page
 _CAT_ORDER = {c: i for i, c in enumerate(PAGE_CATEGORIES)}
 
 
-def _signals(row) -> List[str]:
-    sig = row.get("classification_signals")
-    if sig is None or (isinstance(sig, float) and pd.isna(sig)):
+def _as_list(v) -> List[str]:
+    """A parquet list column value as a plain list (None/NaN → [])."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
         return []
-    return [str(s) for s in list(sig)]
+    return [str(s) for s in list(v)]
+
+
+def _signals(row) -> List[str]:
+    return _as_list(row.get("classification_signals"))
+
+
+def _num(v, default: float = 0.0) -> float:
+    """A float with None/NaN/garbage collapsed to ``default`` — the ``or 0.0``
+    idiom lets NaN through (NaN is truthy), so never use it on parquet values."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return default if pd.isna(f) else f
+
+
+def _text(v) -> str:
+    """A string with None/NaN collapsed to '' (str(nan) would render 'nan')."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return str(v)
 
 
 # --------------------------------------------------------------------------- #
@@ -133,10 +176,18 @@ def load_run(source: str, cfg: Optional[ScrapeConfig] = None
                             if f.endswith(".parquet")
                             and f != cfg.products_filename)
             if not others:
-                raise FileNotFoundError(f"no *.parquet in {source}")
+                found = sorted(f for f in os.listdir(source)
+                               if f.endswith(".parquet"))
+                raise FileNotFoundError(
+                    f"no pages parquet in {source}"
+                    + (f" (found only {', '.join(found)} — a products file "
+                       f"needs its pages table next to it)" if found else ""))
             pages_path = os.path.join(source, others[0])
         prod_path = os.path.join(source, cfg.products_filename)
     else:
+        if not source.endswith(".parquet"):
+            raise ValueError(f"{source} is neither a run directory nor a "
+                             f".parquet file")
         pages_path = source
         prod_path = os.path.join(os.path.dirname(source) or ".",
                                  cfg.products_filename)
@@ -160,7 +211,7 @@ def confidence_report(pages: pd.DataFrame) -> Dict[str, float]:
     """
     if "page_category_confidence" not in pages.columns:
         return {"present": 0.0}
-    c = pages["page_category_confidence"].astype(float)
+    c = pages["page_category_confidence"].astype(float).fillna(0.0)
     n = max(len(c), 1)
     return {
         "present": 1.0,
@@ -204,6 +255,8 @@ def build_diagnostics(pages: pd.DataFrame,
     cfg = cfg or ScrapeConfig()
     if pages is None or pages.empty:
         raise ValueError("pages frame is empty — nothing to diagnose")
+    if max_table_rows is not None and max_table_rows <= 0:
+        raise ValueError("max_table_rows must be positive (or None for all rows)")
     pages = ensure_pages_frame(pages, cfg)
     products = products if products is not None else pd.DataFrame()
 
@@ -213,11 +266,11 @@ def build_diagnostics(pages: pd.DataFrame,
     sub_counts = pages["page_subtype"].value_counts()
     method_counts = pages["classifier_method"].value_counts()
     sig_freq = Counter(s for row in pages["classification_signals"]
-                       for s in list(row))
+                       for s in _as_list(row))
     stages = pages["funnel_stage"].value_counts()
     scope = (pages["fetch_scope"].value_counts()
              if "fetch_scope" in pages.columns else pd.Series(dtype=int))
-    conf = pages["page_category_confidence"].astype(float) \
+    conf = pages["page_category_confidence"].astype(float).fillna(0.0) \
         if "page_category_confidence" in pages.columns else pd.Series(dtype=float)
     rep = confidence_report(pages)
     n_domains = int(pages["domain"].nunique()) if "domain" in pages.columns else 0
@@ -231,9 +284,9 @@ def build_diagnostics(pages: pd.DataFrame,
                 for c, v in cat_counts.items()]
     sub_rows = [(s, int(v), f"page_subtype={s}: {int(v)} of {n} pages")
                 for s, v in sub_counts.items()]
-    method_rows = [(m, int(v), f"{m} — {METHOD_NOTES.get(m, '')} ({int(v)} pages)")
+    method_rows = [(m, int(v), f"{m} — {_method_note(m)} ({int(v)} pages)")
                    for m, v in method_counts.items()]
-    method_notes = {m: METHOD_NOTES.get(m, "") for m, _ in method_counts.items()}
+    method_notes = {m: _method_note(m) for m, _ in method_counts.items()}
     sig_rows = [(_SIG_LABELS.get(k, k), int(v),
                  f"{_SIG_LABELS.get(k, k)} fired on {v} of {n} pages")
                 for k, v in sig_freq.most_common()]
@@ -286,7 +339,7 @@ def build_diagnostics(pages: pd.DataFrame,
         top_m = method_counts.index[0]
         f_method = (f"<b>{_esc(top_m)}</b> decided "
                     f"{int(method_counts.iloc[0])} of {n} labels — "
-                    f"{_esc(METHOD_NOTES.get(top_m, ''))}.")
+                    f"{_esc(_method_note(top_m))}.")
 
     # -- per-category example cards ----------------------------------------- #
     ex_cards = []
@@ -294,15 +347,15 @@ def build_diagnostics(pages: pd.DataFrame,
         grp = pages[pages["page_category"] == c]
         rows_html = []
         for _, r in grp.head(example_rows).iterrows():
-            url = str(r["url"])
+            url = _text(r["url"])
             disp = url.replace("https://www.", "").replace("https://", "")
-            title = str(r.get("title") or "")
-            cv = float(r.get("page_category_confidence") or 0.0)
+            title = _text(r.get("title"))
+            cv = _num(r.get("page_category_confidence"))
             rows_html.append(
                 f'<div class="ex"><span class="mono url" title="{_esc(url)}'
                 f'{" — " + _esc(title) if title else ""}">{_esc(disp[:64])}</span>'
                 f'<span class="ex-meta"><span class="chip">{_esc(r["page_subtype"])}'
-                f'</span> {_esc(r.get("classifier_method", ""))}'
+                f'</span> {_esc(_text(r.get("classifier_method")))}'
                 f' · {cv:.2f}</span></div>')
         more = (f'<div class="ex-more">… and {len(grp) - example_rows} more</div>'
                 if len(grp) > example_rows else "")
@@ -323,23 +376,23 @@ def build_diagnostics(pages: pd.DataFrame,
         table_df = table_df.head(max_table_rows)
     trs = []
     for i, (_, r) in enumerate(table_df.iterrows(), 1):
-        url = str(r["url"])
+        url = _text(r["url"])
         disp = url.replace("https://www.", "").replace("https://", "")
-        title = str(r.get("title") or "")
-        cv = float(r.get("page_category_confidence") or 0.0)
-        rel = float(r.get("skincare_relevance") or 0.0)
-        s = int(r.get("suspicion") or 0)
+        title = _text(r.get("title"))
+        cv = _num(r.get("page_category_confidence"))
+        rel = _num(r.get("skincare_relevance"))
+        s = int(_num(r.get("suspicion")))
         sig = " · ".join(_signals(r.to_dict())) or "—"
-        scope_v = str(r.get("fetch_scope") or "—")
+        scope_v = _text(r.get("fetch_scope")) or "—"
         conf_cls = ' class="num lo"' if cv < 0.9 else ' class="num"'
         trs.append(
             f'<tr><td class="num idx">{i}</td>'
             f'<td class="mono url" title="{_esc(url)}'
             f'{" — " + _esc(title) if title else ""}">{_esc(disp[:56])}</td>'
             f'<td><span class="chip" title="funnel stage: '
-            f'{_esc(r.get("funnel_stage", ""))}">{_esc(r["page_category"])}/'
+            f'{_esc(_text(r.get("funnel_stage")))}">{_esc(r["page_category"])}/'
             f'{_esc(r["page_subtype"])}</span></td>'
-            f'<td>{_esc(r.get("classifier_method", ""))}</td>'
+            f'<td>{_esc(_text(r.get("classifier_method")))}</td>'
             f'<td{conf_cls}>{cv:.2f}</td>'
             f'<td class="num">{rel:.2f}</td>'
             f'<td class="sig">{_esc(sig)}</td>'
@@ -397,11 +450,14 @@ def diagnostics_from_dir(source: str, out_path: Optional[str] = None,
     """Build the diagnostics page from a run directory or a pages parquet
     (the usual entry point). Returns the HTML; also writes it when
     ``out_path`` is given."""
+    import dataclasses
     cfg = cfg or ScrapeConfig()
     pages, products, note = load_run(source, cfg)
-    if os.path.isdir(source):
-        cfg = ScrapeConfig(out_dir=source,
-                           model_path=os.path.join(source, "page_model.npz"))
+    # keep the caller's cfg; only point the run-local fields (suspicion model,
+    # out_dir) at the source's own directory — for files and dirs alike
+    base = source if os.path.isdir(source) else (os.path.dirname(source) or ".")
+    cfg = dataclasses.replace(cfg, out_dir=base,
+                              model_path=os.path.join(base, "page_model.npz"))
     html = build_diagnostics(pages, products, cfg, source_note=note,
                              example_rows=example_rows,
                              max_table_rows=max_table_rows)

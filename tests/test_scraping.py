@@ -1660,6 +1660,35 @@ def test_diagnostics_renders_and_tolerates_bare_url_lists():
         _check(set(ensured["classifier_method"]) == {"rule (url-only)"},
                "url-only provenance visible")
         _check(len(build_diagnostics(ensured)) > 1000, "bare list renders")
+
+        # dirty parquet values must not crash or leak 'nan' into the page:
+        # null signals list, NaN title/confidence, NaN method
+        dirty = pages.head(6).copy()
+        dirty.loc[dirty.index[0], "classification_signals"] = None
+        dirty.loc[dirty.index[1], "title"] = float("nan")
+        dirty.loc[dirty.index[2], "page_category_confidence"] = float("nan")
+        dirty.loc[dirty.index[3], "classifier_method"] = float("nan")
+        dhtml = build_diagnostics(dirty)
+        _check(">nan<" not in dhtml, "NaN never rendered as text")
+
+        # non-positive caps are rejected loudly, not honored nonsensically
+        try:
+            build_diagnostics(pages, max_table_rows=0)
+            _check(False, "max_table_rows=0 must raise")
+        except ValueError:
+            pass
+
+        # a products-only directory names the real problem
+        prod_only = tempfile.mkdtemp(prefix="conveyer_diag_prod_")
+        try:
+            shutil.copy(os.path.join(out, "scraped_products.parquet"), prod_only)
+            try:
+                diagnostics_from_dir(prod_only)
+                _check(False, "products-only dir must raise")
+            except FileNotFoundError as e:
+                _check("pages parquet" in str(e), f"error names the gap: {e}")
+        finally:
+            shutil.rmtree(prod_only, ignore_errors=True)
     finally:
         shutil.rmtree(out, ignore_errors=True)
 

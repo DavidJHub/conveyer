@@ -72,13 +72,22 @@ from conveyer.scraping import ScrapeConfig
 from conveyer.scraping.diagnostics import load_run
 
 # ---- where the already-scraped parquet lives ------------------------------- #
+PRODUCTS_FILE = ScrapeConfig().products_filename
+
+def _usable(p: Path) -> bool:
+    # load_run can read this: a .parquet file, or a directory holding at
+    # least one parquet that is not the products table
+    if p.is_file():
+        return p.suffix == ".parquet"
+    return p.is_dir() and any(f.name != PRODUCTS_FILE for f in p.glob("*.parquet"))
+
 RUN = Path(os.environ.get("CONVEYER_RUN_DIR", "") or (ROOT / "results"))
-if not RUN.exists() or (RUN.is_dir() and not any(RUN.glob("*.parquet"))):
+if not _usable(RUN):
     for cand in (ROOT / "outputs/scrape", ROOT / "outputs/scrape_demo"):
-        if cand.is_dir() and any(cand.glob("*.parquet")):
+        if _usable(cand):
             RUN = cand
             break
-if not RUN.exists() or (RUN.is_dir() and not any(RUN.glob("*.parquet"))):
+if not _usable(RUN):
     # last resort so the notebook executes anywhere: the synthetic demo run
     print("no saved parquet found — generating the synthetic demo run once…")
     from conveyer.scraping import run_scrape
@@ -171,6 +180,11 @@ md("""
 | `rule+prior` | vote **plus** the SimilarWeb `page_type` prior fired |
 | `llm` | a low-confidence page refined by the Anthropic model (needs `ANTHROPIC_API_KEY`) |
 | `human` | a relabel correction — confidence pinned to 1.0, immutable downstream |
+
+Other values you may see: `error` (a row whose processing raised — category
+falls back to `unknown`), a `+url_validated` / `+reclassified` suffix (rows
+touched by the validate/reclassify repair passes), and `rule (url-only)`
+(a bare URL-list input classified without fetching).
 
 `classification_signals` lists every evidence channel that voted on the row —
 the classifier is a vote among independent modalities, any one of which can

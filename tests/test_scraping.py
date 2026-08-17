@@ -1619,6 +1619,80 @@ def test_readout_renders_from_saved_run_and_tracks_corrections():
         shutil.rmtree(out, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- #
+# Diagnostics (every-URL forensics page + input tolerance)
+# --------------------------------------------------------------------------- #
+def test_diagnostics_renders_and_tolerates_bare_url_lists():
+    from conveyer.scraping.diagnostics import (build_diagnostics,
+                                               confidence_report,
+                                               diagnostics_from_dir,
+                                               ensure_pages_frame)
+    out = tempfile.mkdtemp(prefix="conveyer_diag_")
+    try:
+        run_scrape(ScrapeConfig(synthetic_n_pages=20, out_dir=out,
+                                model_path=os.path.join(out, "page_model.npz"),
+                                progress_every=0))
+        html = diagnostics_from_dir(out, os.path.join(out, "diagnostics.html"))
+        _check(os.path.exists(os.path.join(out, "diagnostics.html")), "html written")
+        pages = pd.read_parquet(os.path.join(out, "scraped_pages.parquet"))
+        for marker in ("Every URL", "page_category_confidence", "suspicion",
+                       "Examples by category", "Demo corpus",
+                       "prefers-color-scheme"):
+            _check(marker.lower() in html.lower(), f"page carries '{marker}'")
+        for url in pages["url"].head(5):        # the inventory really is per-URL
+            disp = str(url).replace("https://www.", "").replace("https://", "")
+            _check(disp[:40] in html, f"table carries {url}")
+        _check(diagnostics_from_dir(out) == html, "pure function: same data, same page")
+
+        # the confidence report answers the "which metric?" question with data
+        rep = confidence_report(pages)
+        _check(rep["present"] == 1.0, "confidence column present")
+        _check(0.0 <= rep["share_saturated"] <= 1.0, "share bounded")
+
+        # a capped table must say so out loud — never silently truncate
+        capped = build_diagnostics(pages, max_table_rows=5)
+        _check("most\nsuspicious" in capped or "most suspicious of" in capped.replace("\n", " "),
+               "cap is announced")
+
+        # a bare URL-list parquet classifies URL-only and still renders
+        bare = pd.DataFrame({"url": pages["url"].head(8)})
+        ensured = ensure_pages_frame(bare)
+        _check(set(ensured["classifier_method"]) == {"rule (url-only)"},
+               "url-only provenance visible")
+        _check(len(build_diagnostics(ensured)) > 1000, "bare list renders")
+
+        # dirty parquet values must not crash or leak 'nan' into the page:
+        # null signals list, NaN title/confidence, NaN method
+        dirty = pages.head(6).copy()
+        dirty.loc[dirty.index[0], "classification_signals"] = None
+        dirty.loc[dirty.index[1], "title"] = float("nan")
+        dirty.loc[dirty.index[2], "page_category_confidence"] = float("nan")
+        dirty.loc[dirty.index[3], "classifier_method"] = float("nan")
+        dhtml = build_diagnostics(dirty)
+        _check(">nan<" not in dhtml, "NaN never rendered as text")
+
+        # non-positive caps are rejected loudly, not honored nonsensically
+        try:
+            build_diagnostics(pages, max_table_rows=0)
+            _check(False, "max_table_rows=0 must raise")
+        except ValueError:
+            pass
+
+        # a products-only directory names the real problem
+        prod_only = tempfile.mkdtemp(prefix="conveyer_diag_prod_")
+        try:
+            shutil.copy(os.path.join(out, "scraped_products.parquet"), prod_only)
+            try:
+                diagnostics_from_dir(prod_only)
+                _check(False, "products-only dir must raise")
+            except FileNotFoundError as e:
+                _check("pages parquet" in str(e), f"error names the gap: {e}")
+        finally:
+            shutil.rmtree(prod_only, ignore_errors=True)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

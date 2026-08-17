@@ -80,6 +80,8 @@ def _hbars(rows: Sequence[Tuple[str, float, str]], width: int = 560,
     """Horizontal bars: one hue for magnitude, a ramp only when order carries
     meaning. rows = (label, value, tooltip)."""
     rows = list(rows)
+    if not rows:                     # empty data must not mint a negative-height
+        return '<p class="desc">no data</p>'  # viewBox (an invalid, blank SVG)
     maxv = max((v for _, v, _ in rows), default=1) or 1
     plot_w = width - _LBL_W - _VAL_W
     height = len(rows) * (_BAR_H + _GAP) - _GAP
@@ -158,12 +160,13 @@ def source_note_from_manifest(run_dir: str) -> Optional[str]:
     if src.get("kind") == "synthetic":
         return (f"<strong>Demo corpus, not market data.</strong> This run was "
                 f"scraped from the <em>synthetic</em> ground-truth corpus "
-                f"({src.get('n_pages', '?')} pages, seed {src.get('seed', '?')}) — "
+                f"({_esc(src.get('n_pages', '?'))} pages, "
+                f"seed {_esc(src.get('seed', '?'))}) — "
                 f"which is why any self-evaluation reads perfect. The page "
                 f"regenerates unchanged from a real run.")
     name = _esc(os.path.basename(str(src.get("path", "input"))))
     return (f"<strong>Source:</strong> <span class='mono'>{name}</span> — "
-            f"{manifest.get('pages', '?')} pages, labels computed "
+            f"{_esc(manifest.get('pages', '?'))} pages, labels computed "
             f"{_esc(manifest.get('updated_at', '?'))}.")
 
 

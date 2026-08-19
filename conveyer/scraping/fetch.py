@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -40,7 +41,10 @@ from .config import ScrapeConfig
 class FetchResult:
     url: str
     status: str = "error"          # ok | cached | error | skipped | offline_miss |
-                                   # robots_blocked | circuit_open | blocked
+                                   # robots_blocked | circuit_open | blocked |
+                                   # dns_error (host does not resolve — permanent)
+                                   # dns_unavailable (OUR resolver is down —
+                                   # transient, retry on a later run)
     http_status: Optional[int] = None
     final_url: str = ""
     content_type: str = ""
@@ -88,6 +92,56 @@ _BROWSER_HEADERS = {
 
 _MAX_ERROR_BODY = 4096       # bytes of a non-ok body kept for fingerprinting
 _MAX_HEADERS = 40            # response headers captured per fetch
+
+# --------------------------------------------------------------------------- #
+# DNS failures: permanent for the host, but only if OUR resolver works
+# --------------------------------------------------------------------------- #
+# "Failed to resolve 'www.instagram.com' ([Errno 11001] getaddrinfo failed)"
+# has two very different causes that requests reports identically:
+#
+#   1. the host genuinely does not resolve (NXDOMAIN, dead/typo/parked domain,
+#      a link-shortener that has been shut down). Retrying is pointless — DNS
+#      answers the same way every time — so this must not burn the retry
+#      budget or the wall-clock cap, and the domain's circuit should open at
+#      once so its remaining URLs cost nothing;
+#
+#   2. *our own* resolver is down, the machine is offline, or a VPN/corporate
+#      DNS is between us and the world. Then EVERY domain fails to resolve.
+#      Treating that as "the domain is dead" would open every circuit in the
+#      run and permanently mark a whole corpus unreachable because of a
+#      transient local outage — the single worst failure mode this module has.
+#
+# Telling them apart needs one question: can we resolve anything at all? A
+# cached canary lookup answers it. DNS-down is then reported as a transient
+# `dns_error` that does NOT count as a domain failure, so a resumed run
+# re-tries those URLs once the network is back.
+_DNS_ERROR_MARKERS = (
+    "nameresolutionerror", "getaddrinfo failed", "name or service not known",
+    "temporary failure in name resolution", "nodename nor servname",
+    "[errno 11001]", "[errno -2]", "[errno -3]", "[errno 8]",
+)
+# canary hosts: anycast DNS roots + a couple of very-high-availability names.
+# If none of these resolve, the resolver — not the target — is the problem.
+_DNS_CANARY_HOSTS = ("one.one.one.one", "dns.google", "example.com")
+_DNS_CANARY_TTL = 30.0       # seconds a canary verdict stays valid
+
+
+def _is_dns_failure(exc: BaseException) -> bool:
+    """True when an exception chain is a name-resolution failure.
+
+    Checked structurally first (socket.gaierror anywhere in the cause chain),
+    then by message, because urllib3 wraps gaierror in NameResolutionError ->
+    MaxRetryError -> requests.ConnectionError and the original type is only
+    reachable through __cause__/__context__.
+    """
+    seen, cur = 0, exc
+    while cur is not None and seen < 10:
+        if isinstance(cur, socket.gaierror):
+            return True
+        cur = cur.__cause__ or cur.__context__
+        seen += 1
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(m in text for m in _DNS_ERROR_MARKERS)
 
 
 def _parse_retry_after(value: str) -> Optional[float]:
@@ -184,7 +238,30 @@ class Fetcher:
         # that only ever fails stops being fetched after the threshold — dead or
         # bot-walled hosts must not cost hard_timeout for every one of their URLs.
         self._domain_state: Dict[str, list] = {}
+        # cached resolver-health verdict: (checked_at_monotonic, alive?)
+        self._dns_canary: Optional[tuple] = None
         self._lock = threading.Lock()
+
+    # -- resolver health ---------------------------------------------------- #
+    def _dns_alive(self) -> bool:
+        """Can this machine resolve ANY name right now? Cached for
+        ``_DNS_CANARY_TTL`` so a run with many dead hosts asks at most once
+        every 30s, and so a resolver that comes back mid-run is noticed."""
+        with self._lock:
+            cached = self._dns_canary
+            if cached is not None and (time.monotonic() - cached[0]) < _DNS_CANARY_TTL:
+                return bool(cached[1])
+        alive = False
+        for host in _DNS_CANARY_HOSTS:
+            try:
+                socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+                alive = True
+                break
+            except Exception:
+                continue
+        with self._lock:
+            self._dns_canary = (time.monotonic(), alive)
+        return alive
 
     # -- circuit breaker ---------------------------------------------------- #
     def _circuit_open(self, domain: str) -> bool:
@@ -195,11 +272,19 @@ class Fetcher:
             fails, oks = self._domain_state.get(domain, [0, 0])
         return oks == 0 and fails >= thr
 
-    def _record_outcome(self, domain: str, ok: bool) -> None:
+    def _record_outcome(self, domain: str, ok: bool, fatal: bool = False) -> None:
         with self._lock:
             state = self._domain_state.setdefault(domain, [0, 0])
             if ok:
                 state[0], state[1] = 0, state[1] + 1
+            elif fatal:
+                # provably dead (DNS does not resolve): one observation is
+                # enough — open the circuit now instead of paying two more
+                # lookups to learn the same thing. Clears the success count so
+                # a stale earlier success cannot keep the circuit closed.
+                state[0] = max(state[0] + 1,
+                               int(getattr(self.cfg, "domain_failure_threshold", 3) or 3))
+                state[1] = 0
             else:
                 state[0] += 1
 
@@ -446,6 +531,21 @@ class Fetcher:
                     # the loop's final failure return keeps the salvage
             except Exception as exc:  # network / timeout
                 last_err = f"{type(exc).__name__}: {exc}"
+                # DNS is not a transient hiccup: retrying a name that does not
+                # resolve just burns the wall-clock budget for nothing. Break
+                # out immediately, and only blame the domain if our own
+                # resolver is demonstrably working.
+                if _is_dns_failure(exc):
+                    if self._dns_alive():
+                        self._record_outcome(domain, ok=False, fatal=True)  # host is dead
+                        return FetchResult(
+                            url=url, status="dns_error", fetched_at=_now(),
+                            error=f"host does not resolve: {last_err}")
+                    # our resolver is down — do NOT count this against the
+                    # domain, or a local outage would circuit-open the corpus
+                    return FetchResult(
+                        url=url, status="dns_unavailable", fetched_at=_now(),
+                        error=f"local DNS unavailable, host not judged: {last_err}")
             if attempt < self.cfg.max_retries and time.monotonic() < deadline:
                 time.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
                 backoff *= 2

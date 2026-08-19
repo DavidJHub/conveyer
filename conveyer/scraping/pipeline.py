@@ -476,7 +476,7 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
         print(f"[fetch-policy] {len(to_fetch)} URLs to fetch | {len(deferred)} classified "
               f"without network (URL-decided or over the per-domain budget)")
 
-    n_new = n_ok = n_err = n_circuit = 0
+    n_new = n_ok = n_err = n_circuit = n_dns_skipped = 0
     t_start = time.monotonic()
     pages_fh = open(cfg.pages_jsonl_path(), "a", encoding="utf-8")
     products_fh = open(cfg.products_jsonl_path(), "a", encoding="utf-8")
@@ -497,6 +497,14 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
 
     def handle(fr: FetchResult, allow_base: bool = True) -> None:
         nonlocal n_new, n_ok, n_err, n_circuit
+        # A local resolver outage says nothing about this URL. Committing it
+        # would burn it into the JSONL and resume would skip it forever, so a
+        # 30-second network blip would permanently blank part of the corpus.
+        # Leave it uncommitted: the next run picks it up.
+        if fr.status == "dns_unavailable":
+            nonlocal n_dns_skipped
+            n_dns_skipped += 1
+            return
         row_d = row_by_url.get(fr.url, {"url": fr.url})
         pr, prods = _process_one(cfg, src, row_d, fr, fetcher, profiles,
                                  allow_base=allow_base)
@@ -546,6 +554,9 @@ def run_scrape(cfg: ScrapeConfig, sources: Optional[ScrapeSources] = None) -> Di
 
     pages_df = pd.read_parquet(cfg.pages_path())
     products_df = pd.read_parquet(cfg.products_path())
+    if n_dns_skipped:
+        print(f"[dns] {n_dns_skipped} URL(s) left uncommitted: the local resolver was "
+              f"unavailable, so they were not judged — re-run to pick them up.")
     # stamp what this table was built from, so the next run can tell whether it
     # is the same run continuing or a different input about to be merged in
     write_manifest(cfg, len(pages_df))
